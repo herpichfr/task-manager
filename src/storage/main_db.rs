@@ -4,7 +4,7 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::domain::board::{Board, BoardId, BoardKind};
 use crate::domain::note::{Note, NoteId};
-use crate::domain::task::{NewTask, Status, Task, TaskId, TaskPatch};
+use crate::domain::task::{NewTask, Status, Tag, TagId, Task, TaskId, TaskPatch};
 use crate::storage::task_store_impl as shared;
 use crate::storage::{migrations, StorageError, TaskStore};
 
@@ -261,21 +261,46 @@ impl<'a> TaskStore for PlainBoardStore<'a> {
     fn promote_note(&self, id: NoteId, status: Status) -> Result<TaskId, StorageError> {
         shared::promote_note(self.conn, Some(self.board_id), id, status)
     }
+
+    fn list_tags(&self) -> Result<Vec<Tag>, StorageError> {
+        shared::list_tags(self.conn, Some(self.board_id))
+    }
+
+    fn upsert_tag(&self, name: &str, color: Option<&str>) -> Result<TagId, StorageError> {
+        shared::upsert_tag(self.conn, Some(self.board_id), name, color)
+    }
+
+    fn rename_tag(&self, id: TagId, new_name: &str) -> Result<(), StorageError> {
+        shared::rename_tag(self.conn, Some(self.board_id), id, new_name)
+    }
+
+    fn delete_tag(&self, id: TagId) -> Result<(), StorageError> {
+        shared::delete_tag(self.conn, Some(self.board_id), id)
+    }
+
+    fn tags_for_task(&self, id: TaskId) -> Result<Vec<Tag>, StorageError> {
+        shared::tags_for_task(self.conn, id)
+    }
+
+    fn set_task_tags(&self, id: TaskId, tags: &[TagId]) -> Result<(), StorageError> {
+        shared::set_task_tags(self.conn, id, tags)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::task::Priority;
+    use crate::storage::task_store_impl::shared_tests;
 
     #[test]
     fn migrations_are_idempotent_and_versioned() {
         let conn = Connection::open_in_memory().unwrap();
         assert_eq!(migrations::current_version(&conn).unwrap(), 0);
         migrations::apply(&conn, migrations::MIGRATIONS_MAIN).unwrap();
-        assert_eq!(migrations::current_version(&conn).unwrap(), 1);
+        assert_eq!(migrations::current_version(&conn).unwrap(), 2);
         migrations::apply(&conn, migrations::MIGRATIONS_MAIN).unwrap();
-        assert_eq!(migrations::current_version(&conn).unwrap(), 1);
+        assert_eq!(migrations::current_version(&conn).unwrap(), 2);
     }
 
     #[cfg(unix)]
@@ -334,6 +359,8 @@ mod tests {
                 body: "".into(),
                 status: Status::ToDo,
                 priority: Priority::Normal,
+                start_date: None,
+                deadline: None,
             })
             .unwrap();
         let task = store.get_task(task_id).unwrap();
@@ -358,6 +385,8 @@ mod tests {
                         body: "".into(),
                         status: Status::ToDo,
                         priority: Priority::Normal,
+                        start_date: None,
+                        deadline: None,
                     })
                     .unwrap(),
             );
@@ -373,6 +402,8 @@ mod tests {
             body: "".into(),
             status,
             priority: Priority::Normal,
+            start_date: None,
+            deadline: None,
         }
     }
 
@@ -635,5 +666,69 @@ mod tests {
         let store = db.store_for(board_id);
         let dyn_store: &dyn TaskStore = &store;
         assert!(dyn_store.list_tasks(Status::ToDo).unwrap().is_empty());
+    }
+
+    #[test]
+    fn create_read_task_with_and_without_dates() {
+        let db = MainDb::open_in_memory().unwrap();
+        let board_id = db.create_board("alpha", BoardKind::Plain).unwrap();
+        shared_tests::create_read_task_with_and_without_dates(&db.store_for(board_id));
+    }
+
+    #[test]
+    fn clear_deadline_via_patch_leaves_title_untouched() {
+        let db = MainDb::open_in_memory().unwrap();
+        let board_id = db.create_board("alpha", BoardKind::Plain).unwrap();
+        shared_tests::clear_deadline_via_patch_leaves_title_untouched(&db.store_for(board_id));
+    }
+
+    #[test]
+    fn tag_upsert_is_idempotent_and_rejects_empty_name() {
+        let db = MainDb::open_in_memory().unwrap();
+        let board_id = db.create_board("alpha", BoardKind::Plain).unwrap();
+        shared_tests::tag_upsert_is_idempotent_and_rejects_empty_name(&db.store_for(board_id));
+    }
+
+    #[test]
+    fn tag_rename_and_delete() {
+        let db = MainDb::open_in_memory().unwrap();
+        let board_id = db.create_board("alpha", BoardKind::Plain).unwrap();
+        shared_tests::tag_rename_and_delete(&db.store_for(board_id));
+    }
+
+    #[test]
+    fn set_task_tags_replaces_whole_set_and_reads_back() {
+        let db = MainDb::open_in_memory().unwrap();
+        let board_id = db.create_board("alpha", BoardKind::Plain).unwrap();
+        shared_tests::set_task_tags_replaces_whole_set_and_reads_back(&db.store_for(board_id));
+    }
+
+    #[test]
+    fn deleting_task_cascades_its_tags() {
+        let db = MainDb::open_in_memory().unwrap();
+        let board_id = db.create_board("alpha", BoardKind::Plain).unwrap();
+        shared_tests::deleting_task_cascades_its_tags(&db.store_for(board_id));
+    }
+
+    #[test]
+    fn tags_load_with_list_tasks_for_many_tasks() {
+        let db = MainDb::open_in_memory().unwrap();
+        let board_id = db.create_board("alpha", BoardKind::Plain).unwrap();
+        shared_tests::tags_load_with_list_tasks_for_many_tasks(&db.store_for(board_id));
+    }
+
+    #[test]
+    fn two_boards_do_not_share_tags() {
+        let db = MainDb::open_in_memory().unwrap();
+        let board_a = db.create_board("alpha", BoardKind::Plain).unwrap();
+        let board_b = db.create_board("beta", BoardKind::Plain).unwrap();
+        let store_a = db.store_for(board_a);
+        let store_b = db.store_for(board_b);
+
+        store_a.upsert_tag("shared-name", None).unwrap();
+        store_b.upsert_tag("shared-name", None).unwrap();
+
+        assert_eq!(store_a.list_tags().unwrap().len(), 1);
+        assert_eq!(store_b.list_tags().unwrap().len(), 1);
     }
 }

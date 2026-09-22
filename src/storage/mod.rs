@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 use crate::domain::note::{Note, NoteId};
-use crate::domain::task::{NewTask, Status, Task, TaskId, TaskPatch};
+use crate::domain::task::{NewTask, Status, Tag, TagId, Task, TaskId, TaskPatch};
 
 pub mod locked_db;
 pub mod main_db;
@@ -22,6 +22,8 @@ pub enum StorageError {
     InvalidEnum(String),
     #[error("wrong passphrase")]
     WrongPassphrase,
+    #[error("tag name must not be empty")]
+    EmptyTagName,
 }
 
 /// Storage operations for the tasks and notes of a single board. Implemented
@@ -41,6 +43,12 @@ pub trait TaskStore {
     fn update_note(&self, id: NoteId, body: &str) -> Result<(), StorageError>;
     fn delete_note(&self, id: NoteId) -> Result<(), StorageError>;
     fn promote_note(&self, id: NoteId, status: Status) -> Result<TaskId, StorageError>;
+    fn list_tags(&self) -> Result<Vec<Tag>, StorageError>;
+    fn upsert_tag(&self, name: &str, color: Option<&str>) -> Result<TagId, StorageError>;
+    fn rename_tag(&self, id: TagId, new_name: &str) -> Result<(), StorageError>;
+    fn delete_tag(&self, id: TagId) -> Result<(), StorageError>;
+    fn tags_for_task(&self, id: TaskId) -> Result<Vec<Tag>, StorageError>;
+    fn set_task_tags(&self, id: TaskId, tags: &[TagId]) -> Result<(), StorageError>;
 }
 
 /// Restricts a database file to owner-only access (`0600`).

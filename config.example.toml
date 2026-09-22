@@ -1,0 +1,56 @@
+# tsk configuration.
+# Copy to ~/.config/tsk/config.toml (or point TSK_CONFIG / --config at it).
+# Every key is optional; the values shown are the defaults.
+
+# Where the databases live. Keep this OUT of a synced folder such as
+# Dropbox or Nextcloud -- concurrent sync corrupts SQLite WAL files.
+db_dir = "~/.local/share/tsk"
+
+# Board to open at startup. Unset opens the first board.
+# default_board = "personal"
+
+# External editor for task bodies (the `o` key). Leave empty to use
+# nvim when it is installed, then $VISUAL, then $EDITOR, then vim.
+# Inside tmux the editor opens in a floating popup over the board.
+editor = ""
+
+# Drop an unlocked encrypted board's key when switching away from it.
+lock_on_board_switch = true
+
+# Ask before deleting a task, note or board.
+confirm_delete = true
+
+# Show the key-hint bar along the bottom of the screen.
+show_keyhints = true
+
+[theme]
+# Colours accept an ANSI name ("red", "darkgray", "white"), "reverse",
+# or a hex value like "#ff8700". Hex degrades automatically on terminals
+# without truecolor: to the nearest 256-colour, then to a basic colour.
+
+# --- Card colour by deadline -----------------------------------------
+# A card's colour comes from its DEADLINE. Status is shown by which
+# column the card sits in, so colour is free to mean urgency.
+deadline_none     = "darkgray"   # no due date
+deadline_distant  = "green"      # more than 15 days away
+deadline_soon     = "yellow"     # 14 to 5 days
+deadline_near     = "#ff8700"    # 4 to 2 days (orange; no ANSI name exists)
+deadline_imminent = "red"        # less than 2 days
+deadline_overdue_fg = "white"    # overdue: white text...
+deadline_overdue_bg = "black"    # ...on a black background
+
+# --- Column headers ---------------------------------------------------
+todo  = "yellow"
+doing = "blue"
+done  = "green"
+
+# --- Priority markers -------------------------------------------------
+priority_low    = "darkgray"
+priority_normal = "white"
+priority_high   = "magenta"
+priority_urgent = "red"
+
+# --- Chrome -----------------------------------------------------------
+border    = "darkgray"
+selection = "reverse"
+keyhints  = "darkgray"

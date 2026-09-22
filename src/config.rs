@@ -43,6 +43,17 @@ pub struct Theme {
     pub border: String,
     pub selection: String,
     pub keyhints: String,
+    /// Card colours by deadline urgency. A card's colour comes from its
+    /// deadline, not its status -- status is shown by which column it is in.
+    /// Names ("red"), or `#rrggbb`, which degrades automatically on
+    /// terminals without truecolor.
+    pub deadline_none: String,
+    pub deadline_distant: String,
+    pub deadline_soon: String,
+    pub deadline_near: String,
+    pub deadline_imminent: String,
+    pub deadline_overdue_fg: String,
+    pub deadline_overdue_bg: String,
 }
 
 impl Default for Theme {
@@ -58,6 +69,21 @@ impl Default for Theme {
             border: "darkgray".to_string(),
             selection: "reverse".to_string(),
             keyhints: "darkgray".to_string(),
+            // no due date
+            deadline_none: "darkgray".to_string(),
+            // more than 15 days out
+            deadline_distant: "green".to_string(),
+            // 14-5 days
+            deadline_soon: "yellow".to_string(),
+            // 4-2 days: orange. Written as hex so it degrades to the
+            // nearest 256- or 16-colour automatically; there is no ANSI
+            // named orange.
+            deadline_near: "#ff8700".to_string(),
+            // less than 2 days
+            deadline_imminent: "red".to_string(),
+            // overdue: white on black
+            deadline_overdue_fg: "white".to_string(),
+            deadline_overdue_bg: "black".to_string(),
         }
     }
 }

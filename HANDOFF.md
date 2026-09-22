@@ -4,21 +4,25 @@ Terminal kanban task manager and quick note taker. Vim-native, keyboard-only,
 SQLite-backed, with password-protected boards whose database file is itself
 encrypted.
 
-**Status**: phases 0–8 of the approved plan are done and verified. 178 tests
-pass, `cargo clippy --all-targets -- -D warnings` is clean, ~7,400 lines.
-Approved plan: `~/.claude/plans/silly-tinkering-perlis.md`.
+**Status**: all 14 original requirements plus a round of user feedback are done
+and verified. 258 tests pass, `cargo clippy --all-targets -- -D warnings` is
+clean, ~8,900 lines. Approved plan: `~/.claude/plans/silly-tinkering-perlis.md`.
 
-**The repository has no commits yet** — everything is untracked working tree.
-Nothing has been committed because it was never asked for.
+Installed binary: `~/.local/bin/tsk` (8 MB, release, stripped). Rebuild and
+reinstall with `./install.sh`.
 
 ---
 
 ## How to build and run
 
 ```sh
+./install.sh                             # build + install to ~/.local/bin
+./install.sh --prefix /usr/local         # system-wide (needs sudo)
+./install.sh --uninstall                 # remove the binary, keep the data
+
 export PATH="$HOME/.cargo/bin:$PATH"     # rustup toolchain, rustc 1.98.1
 cargo build                              # or --release
-cargo test                               # 178 tests, all headless
+cargo test                               # 258 tests, all headless
 cargo clippy --all-targets -- -D warnings
 ./target/debug/tsk                       # needs a real TTY
 TSK_DB_DIR=/tmp/scratch ./target/debug/tsk   # isolated database
@@ -39,14 +43,14 @@ current ratatui/rusqlite expect. The toolchain was installed via `rustup` into
 | 3 Local SQLite | Done |
 | 4 No mouse | Done — no mouse capture is ever enabled |
 | 5 Dropdowns for lists | Done: column, priority, tag, board switcher |
-| 6 Tasks coloured by status | Done, plus priority markers `!` / `!!` |
+| 6 Tasks coloured | **By deadline, not status** (user's later instruction) — see the colour table below |
 | 7 Manual status change | Done: `H`/`L`, or the `m` dropdown |
 | 8 Kanban like kanban-tui | Done: three columns, counts in titles |
 | 9 Configurable db/config paths | Done: CLI flag → env → config file → XDG |
 | 10 Debian-like + tmux | Works on Debian 13 in tmux; **Mint not yet tested** (see Open work) |
 | 11 Multiple boards | Done: switcher, `:board new/rename/delete` |
 | 12 Password-secured board | Done: per-board SQLCipher file, Argon2id key |
-| 13 Easy edit/save/modify | Done: forms, `$EDITOR`, undo/redo |
+| 13 Easy edit/save/modify | Done: forms, external editor, undo/redo, tags, start/deadline dates |
 | 14 ToDo/Doing/Done | Done |
 
 ---
@@ -157,37 +161,80 @@ previously world-readable at the mercy of the umask. Tests assert both.
 `h/l` column · `j/k` move · `gg`/`G` · `^d`/`^u` · `Tab` pane · `a`/`i` new ·
 `e` edit · `o` body in nvim · `H`/`L` move column · `J`/`K` reorder · `m`/`p`/`t`
 dropdowns · `dd` delete · `c` capture note · `N` notes pane · `gp` promote ·
-`b` or `<Space>b` boards · `u`/`^r` undo/redo · `/` search · `:` command ·
-`?` help · `ZZ` quit. Commands: `:board new <name> [locked]`,
+`b` or `<Space>b` boards · `S` status dropdown · `u`/`^r` undo/redo ·
+`/` search (`n`/`N` next/prev match, `Esc` or `:nohl` clears) · `:` command ·
+`?` help · `ZZ` quit. In the notes pane `a`/`e`/`dd` act on notes. Commands: `:board new <name> [locked]`,
 `:board rename <name>`, `:board delete <name>`, `:lock`, `:q`.
 
 ---
 
+## Card colour rule (user-specified)
+
+Card colour is driven by the **deadline**, not by status — status is already
+conveyed by which column a card sits in:
+
+| Condition | Colour |
+|---|---|
+| no due date | **grey** |
+| more than 15 days out | green |
+| 14–5 days | yellow |
+| 4–2 days | orange (256-colour 208; degrades to yellow at 16 colours) |
+| less than 2 days | red |
+| overdue | black background, white text |
+
+The user's stated ranges leave exactly 15 days unassigned; 15 is treated as
+green (`Urgency::Distant`).
+
+**All six colours are configurable** in `config.toml` under `[theme]` as
+`deadline_none`, `deadline_distant`, `deadline_soon`, `deadline_near`,
+`deadline_imminent`, `deadline_overdue_fg`, `deadline_overdue_bg`. See
+`config.example.toml` for a documented template. Hex values like `#ff8700`
+degrade automatically: exact RGB on truecolor, nearest 256-colour otherwise.
+Cards show a right-aligned deadline badge (`3d`, `-2d` when overdue).
+
+A bug worth remembering: the 256-colour quantiser originally assumed the
+xterm colour cube was evenly spaced. It is not — the levels are
+`0, 95, 135, 175, 215, 255` — so `#ff8700`, which *is* exactly index 208,
+quantised to 214. `nearest_ansi256` now snaps to the real levels and also
+considers the 24-step greyscale ramp.
+
 ## Open work, roughly in priority order
 
-1. **Search is a stub** (`src/app.rs:1402`). `/`, `n`, `N` enter the mode and
-   manage the buffer, but nothing filters. `N` is already disambiguated
-   (notes-pane toggle vs previous-match) in `keymap::resolve`.
-2. **All-locked boards cannot start.** `App::ensure_startable` refuses to open
+1. **All-locked boards cannot start.** `App::ensure_startable` refuses to open
    directly onto a locked board because no passphrase prompt exists before the
    TUI loop begins. If every board is locked, the CLI will not start. Fix by
    prompting at startup.
-3. **Tag persistence is UI-only.** The `t` dropdown and the form's Tags field are
-   wired but write nothing; the `tags`/`task_tags` tables exist and are unused.
-   Either finish it (add tag methods to `TaskStore`, append a v2 migration rather
-   than editing v1 — users may have a v1 DB on disk) or hide the control. Tags
-   are not among the 14 stated requirements; they were an addition.
-4. **README + packaging**: `cargo-deb` for Debian, plus the tmux truecolor note
-   and required apt build deps.
-5. **Linux Mint MATE is unverified.** Plan is a static
+2. **`j`/`k` can land on a hidden row while a search filter is active.** Search
+   hides non-matching rows at render time, but `col.selected` still indexes the
+   full list; only `n`/`N` walk the matching subset. Either filter the backing
+   list or make plain movement skip hidden rows.
+3. **A status-changing edit takes two undos.** Editing a task and changing its
+   status in the same form pushes two undo commands (the field update, and the
+   `move_task` that keeps column positions dense). Collapse them into one.
+4. **The form's own Tags field is still local-only.** Card-level tagging (`t`)
+   persists correctly; the Tags row inside the task form does not write through.
+5. **README + packaging**: `cargo-deb` for Debian. `install.sh` covers
+   source installs already.
+6. **Linux Mint MATE is unverified.** Plan is a static
    `x86_64-unknown-linux-musl` build as the universal artifact, which avoids the
    glibc skew between Debian 13 (2.41) and Mint 22 (2.39). **Blocked**: needs
    `sudo apt install musl-tools`, which was never run. Building natively on the
-   Mint machine is the alternative.
-6. Undo/redo is in-memory per session and does not survive a restart. Normal for
+   Mint machine (`./install.sh`) is the alternative.
+7. **The tmux floating editor is not verified against a real tmux popup.** The
+   `editor_invocation` split is unit-tested both ways, but nobody has watched
+   `tmux display-popup` actually run nvim over the board. The suspend/restore
+   sequence is still applied in the tmux path, which may be unnecessary.
+8. Undo/redo is in-memory per session and does not survive a restart. Normal for
    a vim-style tool; confirm with the user if persistence is wanted.
 
 ---
+
+## Schema versions
+
+`schema_version` is at **2**. Version 1 is the original tables; version 2 adds
+`tasks.start_date` and `tasks.deadline` (both nullable unix seconds) to the main
+and locked-board schemas. **Never edit an existing migration** — append a new
+version. A real v1 database was upgraded in place and verified to keep its rows.
 
 ## Testing notes for whoever picks this up
 

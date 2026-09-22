@@ -10,7 +10,7 @@ use crate::actions::Action;
 use crate::config::{self, Config};
 use crate::domain::board::{Board, BoardId, BoardKind};
 use crate::domain::note::{Note, NoteId};
-use crate::domain::task::{NewTask, Priority, Status, Task, TaskId, TaskPatch};
+use crate::domain::task::{NewTask, Priority, Status, Tag, TagId, Task, TaskId, TaskPatch};
 use crate::error::{AppError, Result};
 use crate::keymap::{self, Ctx};
 use crate::mode::{Mode, PendingSeq};
@@ -20,6 +20,7 @@ use crate::storage::{StorageError, TaskStore};
 use crate::ui::forms::{Field, FormKind, FormState, TaskDraft};
 use crate::ui::popup::{
     ConfirmState, DropdownState, DropdownTarget, PassphraseState, Popup, PopupOutcome, PopupValue, SelectItem,
+    TagPickerAction, TagPickerState, TextPromptState,
 };
 use crate::ui::theme::{self, Styles};
 use crate::undo::{Command, UndoStack};
@@ -40,17 +41,25 @@ pub struct ColumnState {
 
 /// What a still-open (non-form) popup on top of an otherwise-empty stack
 /// should do with the value it eventually submits. A form-nested dropdown
-/// (opened from the Priority/Tags field of an open task form) never needs
-/// this: it submits into the form via `Popup::receive` instead, since the
-/// form is still on the stack underneath it.
+/// (opened from the Status/Priority/Tags field of an open task form) never
+/// needs this: it submits into the form via `Popup::receive` instead,
+/// since the form is still on the stack underneath it.
 #[derive(Debug, Clone)]
 enum PendingPopupAction {
     MoveTaskColumn(TaskId),
     SetPriority(TaskId),
-    SetTag(TaskId),
     PromoteNote(NoteId),
     ConfirmDeleteTask(TaskId),
     ConfirmDeleteNote(NoteId),
+    /// A new-tag text prompt is open for this task: the typed name is
+    /// created (or reused, if it already exists) and applied to the task.
+    NewTagForTask(TaskId),
+    /// A rename-tag text prompt is open for this tag id.
+    RenameTag(TagId),
+    /// The delete-tag confirmation is open for this tag id.
+    ConfirmDeleteTag(TagId),
+    /// The one-line quick-capture prompt (`c` on the board) is open.
+    QuickCaptureNote,
     /// A dropdown of boards is open; the selected item's id is the target
     /// board id, so this variant itself carries no payload.
     SwitchBoard,
@@ -135,7 +144,24 @@ pub fn storage_err(e: StorageError) -> AppError {
         }
         StorageError::InvalidEnum(v) => AppError::Config(format!("invalid enum value: {v}")),
         StorageError::WrongPassphrase => AppError::WrongPassphrase,
+        StorageError::EmptyTagName => AppError::Config("tag name cannot be empty".to_string()),
     }
+}
+
+/// Case-insensitive "does this task match a search query" test, shared by
+/// live filtering (`ui::board`) and `n`/`N` match-jumping (`App::jump_search`).
+/// A task matches if its title, body, or any tag name contains `query`.
+pub(crate) fn task_matches_query(task: &Task, query: &str) -> bool {
+    let q = query.to_lowercase();
+    task.title.to_lowercase().contains(&q)
+        || task.body.to_lowercase().contains(&q)
+        || task.tags.iter().any(|t| t.name.to_lowercase().contains(&q))
+}
+
+/// Case-insensitive "does this note match a search query" test: matches on
+/// the note's body.
+pub(crate) fn note_matches_query(note: &Note, query: &str) -> bool {
+    note.body.to_lowercase().contains(&query.to_lowercase())
 }
 
 /// First-run bootstrap and board selection.
@@ -224,6 +250,28 @@ fn priority_dropdown_items(current: Priority) -> (Vec<SelectItem>, usize) {
     (items, selected)
 }
 
+/// Finds `current` in `matches` (a sorted list of raw indices that satisfy
+/// a search query) and returns the next/previous entry, wrapping around;
+/// `dir >= 0` is "next", negative is "previous". When `current` is not
+/// itself a match (e.g. selection sits on a filtered-out row), jumps to
+/// the first match in the requested direction instead of wrapping from an
+/// undefined position. Never called with an empty `matches`.
+fn advance_in(matches: &[usize], current: usize, dir: i32) -> usize {
+    let len = matches.len() as i32;
+    let pos = matches.iter().position(|&m| m == current);
+    let new_pos = match pos {
+        Some(p) => (p as i32 + dir).rem_euclid(len),
+        None => {
+            if dir >= 0 {
+                0
+            } else {
+                len - 1
+            }
+        }
+    };
+    matches[new_pos as usize]
+}
+
 /// The active board's store: either the shared main database's rows
 /// (`PlainBoardStore`) or an unlocked `LockedDb`'s own file
 /// (`LockedBoardStore`). See `App::store` for why this is a concrete enum
@@ -304,6 +352,42 @@ impl<'a> TaskStore for ActiveStore<'a> {
         match self {
             ActiveStore::Plain(s) => s.promote_note(id, status),
             ActiveStore::Locked(s) => s.promote_note(id, status),
+        }
+    }
+    fn list_tags(&self) -> std::result::Result<Vec<Tag>, StorageError> {
+        match self {
+            ActiveStore::Plain(s) => s.list_tags(),
+            ActiveStore::Locked(s) => s.list_tags(),
+        }
+    }
+    fn upsert_tag(&self, name: &str, color: Option<&str>) -> std::result::Result<TagId, StorageError> {
+        match self {
+            ActiveStore::Plain(s) => s.upsert_tag(name, color),
+            ActiveStore::Locked(s) => s.upsert_tag(name, color),
+        }
+    }
+    fn rename_tag(&self, id: TagId, new_name: &str) -> std::result::Result<(), StorageError> {
+        match self {
+            ActiveStore::Plain(s) => s.rename_tag(id, new_name),
+            ActiveStore::Locked(s) => s.rename_tag(id, new_name),
+        }
+    }
+    fn delete_tag(&self, id: TagId) -> std::result::Result<(), StorageError> {
+        match self {
+            ActiveStore::Plain(s) => s.delete_tag(id),
+            ActiveStore::Locked(s) => s.delete_tag(id),
+        }
+    }
+    fn tags_for_task(&self, id: TaskId) -> std::result::Result<Vec<Tag>, StorageError> {
+        match self {
+            ActiveStore::Plain(s) => s.tags_for_task(id),
+            ActiveStore::Locked(s) => s.tags_for_task(id),
+        }
+    }
+    fn set_task_tags(&self, id: TaskId, tags: &[TagId]) -> std::result::Result<(), StorageError> {
+        match self {
+            ActiveStore::Plain(s) => s.set_task_tags(id, tags),
+            ActiveStore::Locked(s) => s.set_task_tags(id, tags),
         }
     }
 }
@@ -424,12 +508,26 @@ impl App {
                 Popup::Form(_) => Ctx::Form,
                 Popup::Confirm(_) => Ctx::Confirm,
                 Popup::Passphrase(_) => Ctx::Passphrase,
+                Popup::TagPicker(_) => Ctx::TagPicker,
+                Popup::TextPrompt(_) => Ctx::TextPrompt,
                 Popup::Help => Ctx::Help,
             };
         }
         match self.pane {
             Pane::Board => Ctx::Board,
             Pane::Notes => Ctx::Notes,
+        }
+    }
+
+    /// The active live-typed-or-committed search query, or `None` when no
+    /// filter should apply. Live while typing (`Mode::Search`), and stays
+    /// applied after `Enter` commits it (`search_active`); an empty
+    /// pattern is never treated as an active filter.
+    pub fn search_query(&self) -> Option<String> {
+        if (self.mode == Mode::Search || self.search_active) && !self.search.is_empty() {
+            Some(self.search.clone())
+        } else {
+            None
         }
     }
 
@@ -507,6 +605,7 @@ impl App {
                     self.apply_top_level_value(value);
                 }
             }
+            PopupOutcome::TagPicker(action) => self.apply_tag_picker_action(action),
         }
     }
 
@@ -516,6 +615,7 @@ impl App {
             PopupValue::Selected(item) => self.apply_selected(item),
             PopupValue::Confirmed(yes) => self.apply_confirmed(yes),
             PopupValue::Passphrase(pw) => self.apply_passphrase(pw),
+            PopupValue::Text(text) => self.apply_text(text),
         }
     }
 
@@ -565,12 +665,6 @@ impl App {
                     self.message = Some("update failed".to_string());
                 }
             }
-            PendingPopupAction::SetTag(_id) => {
-                self.message = Some(
-                    "tags aren't persisted yet (needs a domain/storage change outside this phase's file scope)"
-                        .to_string(),
-                );
-            }
             PendingPopupAction::PromoteNote(note_id) => {
                 let Some(new_status) = Status::ALL.get(item.id as usize).copied() else {
                     return;
@@ -601,6 +695,13 @@ impl App {
         match action {
             PendingPopupAction::ConfirmDeleteTask(id) => self.delete_task_now(id),
             PendingPopupAction::ConfirmDeleteNote(id) => self.delete_note_now(id),
+            PendingPopupAction::ConfirmDeleteTag(id) => match self.store().delete_tag(id) {
+                Ok(()) => {
+                    self.message = Some("tag deleted".to_string());
+                    let _ = self.reload();
+                }
+                Err(e) => self.message = Some(format!("delete failed: {e}")),
+            },
             PendingPopupAction::ConfirmCreateLockedBoard { name, passphrase } => {
                 self.create_locked_board_now(&name, &passphrase);
             }
@@ -644,15 +745,145 @@ impl App {
         }
     }
 
+    /// Applies the text submitted by a one-line `TextPrompt`: which
+    /// `PendingPopupAction` was recorded before the prompt was pushed says
+    /// what the text is for (new tag name, rename-tag name, or a
+    /// quick-capture note body).
+    fn apply_text(&mut self, text: String) {
+        let Some(action) = self.pending_action.take() else {
+            return;
+        };
+        match action {
+            PendingPopupAction::NewTagForTask(task_id) => {
+                let store = self.store();
+                match store.upsert_tag(text.trim(), None) {
+                    Ok(tag_id) => {
+                        let mut applied: Vec<TagId> =
+                            store.tags_for_task(task_id).unwrap_or_default().into_iter().map(|t| t.id).collect();
+                        if !applied.contains(&tag_id) {
+                            applied.push(tag_id);
+                        }
+                        match store.set_task_tags(task_id, &applied) {
+                            Ok(()) => {
+                                self.message = Some("tag created".to_string());
+                                let _ = self.reload();
+                            }
+                            Err(e) => self.message = Some(format!("tag apply failed: {e}")),
+                        }
+                    }
+                    Err(e) => self.message = Some(format!("{e}")),
+                }
+            }
+            PendingPopupAction::RenameTag(tag_id) => match self.store().rename_tag(tag_id, text.trim()) {
+                Ok(()) => {
+                    self.message = Some("tag renamed".to_string());
+                    let _ = self.reload();
+                }
+                Err(e) => self.message = Some(format!("{e}")),
+            },
+            PendingPopupAction::QuickCaptureNote => {
+                if text.trim().is_empty() {
+                    self.message = Some("empty capture discarded".to_string());
+                    return;
+                }
+                match self.store().create_note(&text) {
+                    Ok(id) => {
+                        self.undo.push(Command::CreateNote { id });
+                        self.message = Some("note captured".to_string());
+                        let _ = self.reload();
+                    }
+                    Err(e) => self.message = Some(format!("capture failed: {e}")),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Opens the tag picker for `task_id`: every board tag, with the
+    /// task's current tags marked.
+    fn open_tag_picker(&mut self, task_id: TaskId) {
+        let store = self.store();
+        let tags = store.list_tags().unwrap_or_default();
+        let applied = store.tags_for_task(task_id).unwrap_or_default().into_iter().map(|t| t.id).collect();
+        self.popups.push(Popup::TagPicker(TagPickerState { task_id, tags, applied, selected: 0 }));
+    }
+
+    /// Applies a key press handled inside the tag picker. `Toggle` persists
+    /// in place and leaves the picker open; `New`/`Rename`/`Delete` replace
+    /// it with a one-line text prompt or a delete confirmation.
+    fn apply_tag_picker_action(&mut self, action: TagPickerAction) {
+        let Some(Popup::TagPicker(t)) = self.popups.last() else {
+            return;
+        };
+        let task_id = t.task_id;
+        match action {
+            TagPickerAction::Toggle(tag_id) => self.toggle_tag(task_id, tag_id),
+            TagPickerAction::New => {
+                self.popups.pop();
+                self.pending_action = Some(PendingPopupAction::NewTagForTask(task_id));
+                self.popups.push(Popup::TextPrompt(TextPromptState {
+                    prompt: "New tag name".to_string(),
+                    input: String::new(),
+                    error: None,
+                }));
+            }
+            TagPickerAction::Rename(tag_id) => {
+                let current_name =
+                    t.tags.iter().find(|tag| tag.id == tag_id).map(|tag| tag.name.clone()).unwrap_or_default();
+                self.popups.pop();
+                self.pending_action = Some(PendingPopupAction::RenameTag(tag_id));
+                self.popups.push(Popup::TextPrompt(TextPromptState {
+                    prompt: "Rename tag".to_string(),
+                    input: current_name,
+                    error: None,
+                }));
+            }
+            TagPickerAction::Delete(tag_id) => {
+                let name = t.tags.iter().find(|tag| tag.id == tag_id).map(|tag| tag.name.clone()).unwrap_or_default();
+                self.popups.pop();
+                self.pending_action = Some(PendingPopupAction::ConfirmDeleteTag(tag_id));
+                self.popups.push(Popup::Confirm(ConfirmState {
+                    message: format!("delete tag \"{name}\"? this removes it from every task"),
+                }));
+            }
+        }
+    }
+
+    /// Toggles `tag_id` on `task_id` (persisted via `set_task_tags`) and,
+    /// if the tag picker is still the top popup, refreshes its `applied`
+    /// list so the `*` marker updates without closing it.
+    fn toggle_tag(&mut self, task_id: TaskId, tag_id: TagId) {
+        let store = self.store();
+        let mut applied: Vec<TagId> =
+            store.tags_for_task(task_id).unwrap_or_default().into_iter().map(|t| t.id).collect();
+        if let Some(pos) = applied.iter().position(|id| *id == tag_id) {
+            applied.remove(pos);
+        } else {
+            applied.push(tag_id);
+        }
+        match store.set_task_tags(task_id, &applied) {
+            Ok(()) => {
+                let _ = self.reload();
+                if let Some(Popup::TagPicker(t)) = self.popups.last_mut() {
+                    t.applied = applied;
+                }
+            }
+            Err(e) => self.message = Some(format!("tag update failed: {e}")),
+        }
+    }
+
     fn apply_task_draft(&mut self, draft: TaskDraft) {
         let store = self.store();
         match draft.kind {
-            FormKind::NewTask(status) => {
+            FormKind::NewTask(_) => {
+                let status = draft.status;
                 let new_task = NewTask {
                     title: draft.title.clone(),
                     body: draft.body.clone(),
                     status,
                     priority: draft.priority,
+                    start_date: draft.start_date,
+                    deadline: draft.deadline,
                 };
                 match store.create_task(new_task) {
                     Ok(id) => {
@@ -675,21 +906,44 @@ impl App {
                     body: Some(before_task.body.clone()),
                     status: None,
                     priority: Some(before_task.priority),
+                    start_date: Some(before_task.start_date),
+                    deadline: Some(before_task.deadline),
                 };
                 let after = TaskPatch {
                     title: Some(draft.title.clone()),
                     body: Some(draft.body.clone()),
                     status: None,
                     priority: Some(draft.priority),
+                    start_date: Some(draft.start_date),
+                    deadline: Some(draft.deadline),
                 };
-                match store.update_task(id, after.clone()) {
-                    Ok(()) => {
-                        self.undo.push(Command::UpdateTask { id, before, after });
-                        self.message = Some(format!("updated \"{}\"", draft.title));
-                        let _ = self.reload();
-                    }
-                    Err(e) => self.message = Some(format!("update failed: {e}")),
+                if let Err(e) = store.update_task(id, after.clone()) {
+                    self.message = Some(format!("update failed: {e}"));
+                    return;
                 }
+                // Status moves through `move_task` (not the patch above),
+                // the same as `H`/`L`/`m`/`S`, so dense per-column
+                // positions stay correct; its own undo command is pushed
+                // alongside the field update's, once `store` (which
+                // borrows all of `self`) is done being used -- pushing to
+                // `self.undo` while `store` is still alive does not
+                // borrow-check.
+                let status_move = if draft.status != before_task.status && store.move_task(id, draft.status, i64::MAX).is_ok() {
+                    let after_pos = store.get_task(id).map(|t| t.position).unwrap_or(0);
+                    Some((draft.status, after_pos))
+                } else {
+                    None
+                };
+                self.undo.push(Command::UpdateTask { id, before, after });
+                if let Some((new_status, after_pos)) = status_move {
+                    self.undo.push(Command::MoveTask {
+                        id,
+                        from: (before_task.status, before_task.position),
+                        to: (new_status, after_pos),
+                    });
+                }
+                self.message = Some(format!("updated \"{}\"", draft.title));
+                let _ = self.reload();
             }
             FormKind::NewNote => {
                 let body = combine_note_body(&draft.title, &draft.body);
@@ -904,6 +1158,8 @@ impl App {
                     body: snapshot.body.clone(),
                     status: snapshot.status,
                     priority: snapshot.priority,
+                    start_date: snapshot.start_date,
+                    deadline: snapshot.deadline,
                 })?;
                 store.move_task(new_id, snapshot.status, snapshot.position)?;
                 Ok(Command::CreateTask { id: new_id, status: snapshot.status })
@@ -992,7 +1248,7 @@ impl App {
     }
 
     /// Parses and runs one command-mode line (without the leading `:`).
-    /// Recognises `q`/`quit`, `lock`, and the `board <sub>` family;
+    /// Recognises `q`/`quit`, `lock`, `nohl`, and the `board <sub>` family;
     /// anything else reports itself as not implemented, same as before
     /// this phase.
     fn run_command(&mut self, cmd: &str) {
@@ -1005,6 +1261,12 @@ impl App {
         }
         if cmd == "lock" {
             self.lock_current_board();
+            return;
+        }
+        if cmd == "nohl" {
+            self.search.clear();
+            self.search_active = false;
+            self.message = Some("search cleared".to_string());
             return;
         }
         if let Some(rest) = cmd.strip_prefix("board ") {
@@ -1308,10 +1570,12 @@ impl App {
             }
             KeyCode::Esc => {
                 self.search.clear();
+                self.search_active = false;
                 self.mode = Mode::Normal;
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.search.clear();
+                self.search_active = false;
                 self.mode = Mode::Normal;
             }
             KeyCode::Backspace => {
@@ -1320,6 +1584,51 @@ impl App {
             KeyCode::Char(c) => self.search.push(c),
             _ => {}
         }
+    }
+
+    /// Moves the selection to the next (`dir >= 0`) or previous (`dir < 0`)
+    /// match for the active search query, in the focused pane, wrapping
+    /// around. Reports a message instead when there is no active search or
+    /// no match.
+    fn jump_search(&mut self, dir: i32) {
+        let Some(query) = self.search_query() else {
+            self.message = Some("no active search".to_string());
+            return;
+        };
+        match self.pane {
+            Pane::Board => {
+                let idx = self.focused;
+                let matches: Vec<usize> = self.columns[idx]
+                    .tasks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| task_matches_query(t, &query))
+                    .map(|(i, _)| i)
+                    .collect();
+                if matches.is_empty() {
+                    self.message = Some("no matches".to_string());
+                    return;
+                }
+                let cur = self.columns[idx].selected;
+                self.columns[idx].selected = advance_in(&matches, cur, dir);
+            }
+            Pane::Notes => {
+                let matches: Vec<usize> = self
+                    .notes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, n)| note_matches_query(n, &query))
+                    .map(|(i, _)| i)
+                    .collect();
+                if matches.is_empty() {
+                    self.message = Some("no matches".to_string());
+                    return;
+                }
+                let cur = self.notes_selected;
+                self.notes_selected = advance_in(&matches, cur, dir);
+            }
+        }
+        self.message = None;
     }
 
     /// Executes a resolved `Action`. Only ever called with an empty popup
@@ -1333,7 +1642,13 @@ impl App {
                 self.mode = Mode::Normal;
                 self.cmdline.clear();
                 self.search.clear();
+                self.search_active = false;
                 self.pending.clear();
+                // Esc always returns focus to the board -- including from
+                // the notes pane, which otherwise had no way back once
+                // hiding the pane (`ToggleNotesPane`) stopped being the
+                // only route out of it.
+                self.pane = Pane::Board;
             }
             Action::Refresh => {
                 self.message = match self.reload() {
@@ -1381,13 +1696,24 @@ impl App {
             }
             Action::ToggleNotesPane => {
                 self.show_notes = !self.show_notes;
+                // Hiding the pane while it is focused must give focus back
+                // to the board: otherwise keys kept going to an invisible
+                // pane and the app looked frozen.
+                if !self.show_notes {
+                    self.pane = Pane::Board;
+                }
                 self.message = None;
             }
             Action::TogglePane => {
-                self.pane = match self.pane {
-                    Pane::Board => Pane::Notes,
-                    Pane::Notes => Pane::Board,
-                };
+                // Only meaningful while the notes pane is visible; with it
+                // hidden this is a no-op rather than focusing a pane the
+                // user cannot see or reach any other way.
+                if self.show_notes {
+                    self.pane = match self.pane {
+                        Pane::Board => Pane::Notes,
+                        Pane::Notes => Pane::Board,
+                    };
+                }
                 self.message = None;
             }
             Action::StartSearch => {
@@ -1398,21 +1724,34 @@ impl App {
                 self.mode = Mode::Command;
                 self.cmdline.clear();
             }
-            Action::SearchNext | Action::SearchPrev => {
-                self.message = Some("search not implemented yet".to_string());
-            }
+            Action::SearchNext => self.jump_search(1),
+            Action::SearchPrev => self.jump_search(-1),
 
             Action::NewTask => {
-                let status = Status::ALL[self.focused];
-                self.popups.push(Popup::Form(FormState::new_task(status)));
+                match self.pane {
+                    Pane::Board => {
+                        let status = Status::ALL[self.focused];
+                        self.popups.push(Popup::Form(FormState::new_task(status)));
+                    }
+                    Pane::Notes => {
+                        self.popups.push(Popup::Form(FormState::new_note()));
+                    }
+                }
                 self.message = None;
             }
 
             Action::EditSelected => match self.pane {
                 Pane::Board => {
                     if let Some(task) = self.selected_task().cloned() {
-                        self.popups
-                            .push(Popup::Form(FormState::edit_task(task.id, task.title, task.body, task.priority)));
+                        self.popups.push(Popup::Form(FormState::edit_task(
+                            task.id,
+                            task.title,
+                            task.body,
+                            task.priority,
+                            task.status,
+                            task.start_date,
+                            task.deadline,
+                        )));
                         self.message = None;
                     } else {
                         self.message = Some("no task selected".to_string());
@@ -1473,7 +1812,16 @@ impl App {
             },
 
             Action::CaptureNote => {
-                self.popups.push(Popup::Form(FormState::new_note()));
+                // A genuine one-line quick capture: saves on Enter without
+                // ever leaving the board, unlike the full New-note form
+                // (still reachable via `a`/`i` while the notes pane is
+                // focused).
+                self.pending_action = Some(PendingPopupAction::QuickCaptureNote);
+                self.popups.push(Popup::TextPrompt(TextPromptState {
+                    prompt: "Quick note".to_string(),
+                    input: String::new(),
+                    error: None,
+                }));
                 self.message = None;
             }
 
@@ -1498,7 +1846,7 @@ impl App {
                     let selected = Status::ALL.iter().position(|s| *s == task.status).unwrap_or(0);
                     self.pending_action = Some(PendingPopupAction::MoveTaskColumn(id));
                     self.popups.push(Popup::Dropdown(DropdownState {
-                        title: "Move to column".to_string(),
+                        title: "Status".to_string(),
                         items: column_dropdown_items(),
                         selected,
                         target: DropdownTarget::Column,
@@ -1527,13 +1875,8 @@ impl App {
             Action::OpenTagDropdown => {
                 if let Some(task) = self.selected_task() {
                     let id = task.id;
-                    self.pending_action = Some(PendingPopupAction::SetTag(id));
-                    self.popups.push(Popup::Dropdown(DropdownState {
-                        title: "Tags".to_string(),
-                        items: vec![SelectItem { id: -1, label: "+ new tag…".to_string() }],
-                        selected: 0,
-                        target: DropdownTarget::Tag,
-                    }));
+                    self.open_tag_picker(id);
+                    self.message = None;
                 } else {
                     self.message = Some("no task selected".to_string());
                 }
@@ -1609,6 +1952,8 @@ mod tests {
                         body: String::new(),
                         status: Status::ToDo,
                         priority: DomainPriority::Normal,
+                    start_date: None,
+                    deadline: None,
                     })
                     .unwrap();
             }
@@ -1739,6 +2084,41 @@ mod tests {
         assert_eq!(app.pane, Pane::Board);
         app.dispatch(Action::TogglePane);
         assert_eq!(app.pane, Pane::Notes);
+    }
+
+    /// Regression: hiding the notes pane while it is focused must return
+    /// focus to the board -- otherwise keys kept going to an invisible
+    /// pane and the app looked frozen.
+    #[test]
+    fn hiding_the_notes_pane_while_focused_restores_board_focus() {
+        let mut app = test_app_with_tasks();
+        app.dispatch(Action::ToggleNotesPane); // show
+        app.dispatch(Action::TogglePane); // focus -> Notes
+        assert_eq!(app.pane, Pane::Notes);
+
+        app.dispatch(Action::ToggleNotesPane); // hide
+        assert!(!app.show_notes);
+        assert_eq!(app.pane, Pane::Board, "hiding the pane must restore board focus");
+    }
+
+    #[test]
+    fn tab_is_a_noop_while_the_notes_pane_is_hidden() {
+        let mut app = test_app_with_tasks();
+        assert!(!app.show_notes);
+        app.dispatch(Action::TogglePane);
+        assert_eq!(app.pane, Pane::Board, "Tab must not focus an invisible pane");
+    }
+
+    #[test]
+    fn esc_in_the_notes_pane_returns_focus_to_the_board() {
+        let mut app = test_app_with_tasks();
+        app.dispatch(Action::ToggleNotesPane);
+        app.dispatch(Action::TogglePane);
+        assert_eq!(app.pane, Pane::Notes);
+
+        app.dispatch(Action::Cancel);
+        assert_eq!(app.pane, Pane::Board);
+        assert!(app.show_notes, "Esc only moves focus, it does not hide the pane");
     }
 
     #[test]
@@ -1929,6 +2309,286 @@ mod tests {
         let mut app = test_app_with_tasks();
         app.dispatch(Action::Undo);
         assert_eq!(app.message.as_deref(), Some("nothing to undo"));
+    }
+
+    // --- Phase: Status field / S key / date fields ------------------------
+
+    #[test]
+    fn shift_s_opens_a_status_dropdown_and_moves_the_task() {
+        let mut app = test_app_with_tasks();
+        let id = app.columns[0].tasks[0].id;
+        app.handle_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
+        assert!(matches!(app.popups.last(), Some(Popup::Dropdown(_))));
+        if let Some(Popup::Dropdown(d)) = app.popups.last_mut() {
+            let idx = d.items.iter().position(|i| i.label == "Done").unwrap();
+            d.selected = idx;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.popups.is_empty());
+        assert_eq!(app.columns[2].tasks.iter().find(|t| t.id == id).unwrap().status, Status::Done);
+        assert!(app.columns[0].tasks.iter().all(|t| t.id != id));
+    }
+
+    #[test]
+    fn edit_task_form_carries_status_and_dates_and_round_trips() {
+        let mut app = test_app_with_tasks();
+        let id = app.columns[0].tasks[0].id;
+        {
+            let store = app.db.store_for(app.board.id);
+            store
+                .update_task(
+                    id,
+                    TaskPatch { deadline: Some(Some(1_735_000_000)), ..Default::default() },
+                )
+                .unwrap();
+        }
+        let _ = app.reload();
+
+        app.dispatch(Action::EditSelected);
+        let Some(Popup::Form(f)) = app.popups.last() else { panic!("expected form") };
+        assert_eq!(f.deadline_text, crate::domain::dates::format_date(1_735_000_000));
+
+        // Change status via the form's Status field and save.
+        let mut outcome;
+        {
+            let f = match app.popups.last_mut() { Some(Popup::Form(f)) => f, _ => unreachable!() };
+            f.field = Field::Status;
+            outcome = f.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        app.apply_popup_outcome(outcome);
+        if let Some(Popup::Dropdown(d)) = app.popups.last_mut() {
+            let idx = d.items.iter().position(|i| i.label == "Doing").unwrap();
+            d.selected = idx;
+        }
+        outcome = app.popups.last_mut().unwrap().handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.apply_popup_outcome(outcome);
+
+        outcome = app
+            .popups
+            .last_mut()
+            .unwrap()
+            .handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        app.apply_popup_outcome(outcome);
+        assert!(app.popups.is_empty());
+
+        let moved = app.columns[1].tasks.iter().find(|t| t.id == id).expect("task moved to Doing");
+        // The deadline round-trips through the form's text field at
+        // day granularity (`dates::format_date`/`parse_date`), so it is
+        // normalized to that day's local midnight rather than preserving
+        // the original sub-day timestamp exactly.
+        assert_eq!(
+            crate::domain::dates::format_date(moved.deadline.unwrap()),
+            crate::domain::dates::format_date(1_735_000_000)
+        );
+    }
+
+    // --- Phase: tag create/rename/delete/toggle ----------------------------
+
+    #[test]
+    fn tag_new_toggle_rename_delete_round_trip_and_persist() {
+        let mut app = test_app_with_tasks();
+        let id = app.columns[0].tasks[0].id;
+
+        // `t` opens the tag picker.
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert!(matches!(app.popups.last(), Some(Popup::TagPicker(_))));
+
+        // Enter on "+ new tag..." starts the new-tag flow.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.popups.last(), Some(Popup::TextPrompt(_))));
+        for c in "urgent-home".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.popups.is_empty());
+
+        let tags = app.store().tags_for_task(id).unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].name, "urgent-home");
+        assert!(app.columns[0].tasks.iter().find(|t| t.id == id).unwrap().tags.iter().any(|t| t.name == "urgent-home"));
+
+        // Toggle it back off from the picker.
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // toggle off the first (only) tag row
+        assert!(matches!(app.popups.last(), Some(Popup::TagPicker(_))), "toggle keeps the picker open");
+        assert!(app.store().tags_for_task(id).unwrap().is_empty());
+
+        // Toggle it back on, then rename it.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.store().tags_for_task(id).unwrap().len(), 1);
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(matches!(app.popups.last(), Some(Popup::TextPrompt(_))));
+        // Clear the prefilled name and type a new one.
+        for _ in 0.."urgent-home".len() {
+            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        for c in "renamed".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.popups.is_empty());
+        let tags = app.store().list_tags().unwrap();
+        assert_eq!(tags.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), vec!["renamed"]);
+
+        // Delete it (with confirm).
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(matches!(app.popups.last(), Some(Popup::Confirm(_))));
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.popups.is_empty());
+        assert!(app.store().list_tags().unwrap().is_empty());
+    }
+
+    #[test]
+    fn empty_new_tag_name_is_rejected() {
+        let mut app = test_app_with_tasks();
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // "+ new tag..."
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // submit empty
+        assert_eq!(app.message.as_deref(), Some("tag name must not be empty"));
+    }
+
+    // --- Phase: a/e/dd act on the focused pane ------------------------------
+
+    #[test]
+    fn a_in_notes_pane_opens_a_new_note_form_not_a_new_task_form() {
+        let mut app = test_app_with_tasks();
+        app.dispatch(Action::ToggleNotesPane);
+        app.dispatch(Action::TogglePane);
+        assert_eq!(app.pane, Pane::Notes);
+
+        app.dispatch(Action::NewTask); // bound to 'a'/'i'
+        match app.popups.last() {
+            Some(Popup::Form(f)) => assert_eq!(f.kind, FormKind::NewNote),
+            other => panic!("expected a new-note form, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn e_in_notes_pane_edits_the_selected_note() {
+        let mut app = test_app_with_tasks();
+        app.store().create_note("my note").unwrap();
+        let _ = app.reload();
+        app.dispatch(Action::ToggleNotesPane);
+        app.dispatch(Action::TogglePane);
+
+        app.dispatch(Action::EditSelected);
+        match app.popups.last() {
+            Some(Popup::Form(f)) => assert_eq!(f.kind, FormKind::EditNote),
+            other => panic!("expected an edit-note form, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dd_in_notes_pane_deletes_the_selected_note() {
+        let mut app = test_app_with_tasks();
+        app.store().create_note("throwaway").unwrap();
+        let _ = app.reload();
+        app.dispatch(Action::ToggleNotesPane);
+        app.dispatch(Action::TogglePane);
+        app.config.confirm_delete = false;
+
+        assert_eq!(app.notes.len(), 1);
+        app.dispatch(Action::DeleteSelected);
+        assert_eq!(app.notes.len(), 0);
+    }
+
+    #[test]
+    fn gp_promote_still_works() {
+        let mut app = test_app_with_tasks();
+        app.store().create_note("promote me").unwrap();
+        let _ = app.reload();
+        app.dispatch(Action::ToggleNotesPane);
+        app.dispatch(Action::TogglePane);
+
+        app.dispatch(Action::PromoteNote);
+        assert!(matches!(app.popups.last(), Some(Popup::Dropdown(_))));
+        let outcome = app.popups.last_mut().unwrap().handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.apply_popup_outcome(outcome);
+        assert!(app.popups.is_empty());
+        assert!(app.columns[0].tasks.iter().any(|t| t.title.contains("promote me")));
+    }
+
+    // --- Phase: quick capture ('c') -----------------------------------------
+
+    #[test]
+    fn c_is_a_one_line_quick_capture_that_saves_on_enter() {
+        let mut app = test_app_with_tasks();
+        app.dispatch(Action::CaptureNote);
+        assert!(matches!(app.popups.last(), Some(Popup::TextPrompt(_))));
+        for c in "call the dentist".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.popups.is_empty());
+        assert_eq!(app.notes.len(), 1);
+        assert_eq!(app.notes[0].body, "call the dentist");
+    }
+
+    // --- Phase: search -------------------------------------------------------
+
+    #[test]
+    fn search_active_filters_and_n_moves_to_next_match() {
+        let mut app = test_app_with_tasks(); // tasks: "a", "b", "c"
+        app.store().create_task(DomainNewTask {
+            title: "abc".to_string(),
+            body: String::new(),
+            status: Status::ToDo,
+            priority: DomainPriority::Normal,
+            start_date: None,
+            deadline: None,
+        }).unwrap();
+        let _ = app.reload();
+        // titles now: a, b, c, abc -- "a" matches "a" (idx 0) and "abc" (idx 3)
+
+        app.dispatch(Action::StartSearch);
+        for c in "a".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // commit
+        assert!(app.search_active);
+        assert_eq!(app.search_query().as_deref(), Some("a"));
+
+        app.columns[0].selected = 0;
+        app.dispatch(Action::SearchNext);
+        assert_eq!(app.columns[0].selected, 3);
+        app.dispatch(Action::SearchNext);
+        assert_eq!(app.columns[0].selected, 0, "wraps back to the first match");
+        app.dispatch(Action::SearchPrev);
+        assert_eq!(app.columns[0].selected, 3);
+    }
+
+    #[test]
+    fn esc_in_normal_mode_clears_an_active_search_filter() {
+        let mut app = test_app_with_tasks();
+        app.search = "b".to_string();
+        app.search_active = true;
+        assert!(app.search_query().is_some());
+
+        app.dispatch(Action::Cancel);
+        assert!(app.search_query().is_none());
+        assert!(!app.search_active);
+        assert!(app.search.is_empty());
+    }
+
+    #[test]
+    fn nohl_command_clears_an_active_search_filter() {
+        let mut app = test_app_with_tasks();
+        app.search = "b".to_string();
+        app.search_active = true;
+        app.mode = Mode::Command;
+        for c in "nohl".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.search_query().is_none());
+    }
+
+    #[test]
+    fn search_next_with_no_active_search_reports_a_message() {
+        let mut app = test_app_with_tasks();
+        app.dispatch(Action::SearchNext);
+        assert_eq!(app.message.as_deref(), Some("no active search"));
     }
 
     // --- board switching + locked boards -----------------------------------

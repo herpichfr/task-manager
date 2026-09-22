@@ -99,6 +99,11 @@ pub struct Task {
     pub position: i64,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Unix seconds, `None` = unset.
+    pub start_date: Option<i64>,
+    /// Unix seconds, `None` = unset.
+    pub deadline: Option<i64>,
+    pub tags: Vec<Tag>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +112,10 @@ pub struct NewTask {
     pub body: String,
     pub status: Status,
     pub priority: Priority,
+    /// Unix seconds, `None` = unset.
+    pub start_date: Option<i64>,
+    /// Unix seconds, `None` = unset.
+    pub deadline: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -115,9 +124,13 @@ pub struct TaskPatch {
     pub body: Option<String>,
     pub status: Option<Status>,
     pub priority: Option<Priority>,
+    /// `None` = leave unchanged, `Some(None)` = clear, `Some(Some(v))` = set.
+    pub start_date: Option<Option<i64>>,
+    /// `None` = leave unchanged, `Some(None)` = clear, `Some(Some(v))` = set.
+    pub deadline: Option<Option<i64>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tag {
     pub id: TagId,
     pub name: String,

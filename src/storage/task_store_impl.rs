@@ -8,25 +8,69 @@
 //! caller already knows the value (or knows there isn't one) -- so one
 //! column list serves both, and this is the one place the position/dense-
 //! repacking arithmetic and promote-note splitting logic exist.
+//!
+//! `tags`/`task_tags` have no `board_id` filtering concern once a `task_id`
+//! or `tag_id` is in hand -- a plain board's tags row still carries its own
+//! `board_id` column (used by `list_tags`/`upsert_tag`/`rename_tag`/
+//! `delete_tag`, which enumerate or address tags directly), but the
+//! `task_tags` junction just relates a `task_id` to a `tag_id`, both of
+//! which are already scoped correctly by whoever looked them up.
+
+use std::collections::HashMap;
 
 use rusqlite::Connection;
 
 use crate::domain::board::BoardId;
 use crate::domain::note::{Note, NoteId};
-use crate::domain::task::{NewTask, Priority, Status, Task, TaskId, TaskPatch};
+use crate::domain::task::{NewTask, Priority, Status, Tag, TagId, Task, TaskId, TaskPatch};
 use crate::storage::StorageError;
 
-type RawTaskRow = (TaskId, String, String, String, String, i64, i64, i64);
+type RawTaskRow = (
+    TaskId,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    i64,
+    Option<i64>,
+    Option<i64>,
+);
 
 fn row_to_raw_task(row: &rusqlite::Row) -> rusqlite::Result<RawTaskRow> {
-    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?))
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+    ))
 }
 
 fn task_from_parts(board_id: Option<BoardId>, raw: RawTaskRow) -> Result<Task, StorageError> {
-    let (id, title, body, status, priority, position, created_at, updated_at) = raw;
+    let (id, title, body, status, priority, position, created_at, updated_at, start_date, deadline) = raw;
     let status = Status::from_str(&status).ok_or_else(|| StorageError::InvalidEnum(status.clone()))?;
     let priority = Priority::from_str(&priority).ok_or_else(|| StorageError::InvalidEnum(priority.clone()))?;
-    Ok(Task { id, board_id, title, body, status, priority, position, created_at, updated_at })
+    Ok(Task {
+        id,
+        board_id,
+        title,
+        body,
+        status,
+        priority,
+        position,
+        created_at,
+        updated_at,
+        start_date,
+        deadline,
+        tags: Vec::new(),
+    })
 }
 
 type RawNoteRow = (NoteId, String, Option<TaskId>, i64, i64);
@@ -40,36 +84,78 @@ fn note_from_parts(board_id: Option<BoardId>, raw: RawNoteRow) -> Note {
     Note { id, board_id, body, promoted_task_id, created_at, updated_at }
 }
 
+const TASK_COLUMNS: &str =
+    "id, title, body, status, priority, position, created_at, updated_at, start_date, deadline";
+
+/// Loads the tags for several tasks in one query (`task_id IN (...)`),
+/// grouped by `task_id`. Called once per `list_tasks`/`get_task` call
+/// regardless of how many tasks are involved -- never once per task.
+fn tags_for_task_ids(conn: &Connection, task_ids: &[TaskId]) -> Result<HashMap<TaskId, Vec<Tag>>, StorageError> {
+    let mut map: HashMap<TaskId, Vec<Tag>> = HashMap::new();
+    if task_ids.is_empty() {
+        return Ok(map);
+    }
+    let placeholders = vec!["?"; task_ids.len()].join(",");
+    let sql = format!(
+        "SELECT tt.task_id, t.id, t.name, t.color FROM task_tags tt
+         JOIN tags t ON t.id = tt.tag_id
+         WHERE tt.task_id IN ({placeholders}) ORDER BY t.name"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> = task_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        let task_id: TaskId = row.get(0)?;
+        let tag = Tag { id: row.get(1)?, name: row.get(2)?, color: row.get(3)? };
+        Ok((task_id, tag))
+    })?;
+    for row in rows {
+        let (task_id, tag) = row?;
+        map.entry(task_id).or_default().push(tag);
+    }
+    Ok(map)
+}
+
 pub(crate) fn list_tasks(conn: &Connection, board_id: Option<BoardId>, status: Status) -> Result<Vec<Task>, StorageError> {
     let sql = match board_id {
-        Some(_) => "SELECT id, title, body, status, priority, position, created_at, updated_at
-                     FROM tasks WHERE board_id = ?1 AND status = ?2 ORDER BY position",
-        None => "SELECT id, title, body, status, priority, position, created_at, updated_at
-                  FROM tasks WHERE status = ?1 ORDER BY position",
+        Some(_) => format!("SELECT {TASK_COLUMNS} FROM tasks WHERE board_id = ?1 AND status = ?2 ORDER BY position"),
+        None => format!("SELECT {TASK_COLUMNS} FROM tasks WHERE status = ?1 ORDER BY position"),
     };
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare(&sql)?;
     let rows: Vec<RawTaskRow> = if let Some(bid) = board_id {
         stmt.query_map(rusqlite::params![bid, status.as_str()], row_to_raw_task)?.collect::<Result<_, _>>()?
     } else {
         stmt.query_map(rusqlite::params![status.as_str()], row_to_raw_task)?.collect::<Result<_, _>>()?
     };
-    rows.into_iter().map(|r| task_from_parts(board_id, r)).collect()
+
+    let task_ids: Vec<TaskId> = rows.iter().map(|r| r.0).collect();
+    let mut tags_map = tags_for_task_ids(conn, &task_ids)?;
+
+    rows.into_iter()
+        .map(|raw| {
+            let id = raw.0;
+            let mut task = task_from_parts(board_id, raw)?;
+            task.tags = tags_map.remove(&id).unwrap_or_default();
+            Ok(task)
+        })
+        .collect()
 }
 
 pub(crate) fn get_task(conn: &Connection, board_id: Option<BoardId>, id: TaskId) -> Result<Task, StorageError> {
     let sql = match board_id {
-        Some(_) => "SELECT id, title, body, status, priority, position, created_at, updated_at
-                     FROM tasks WHERE id = ?1 AND board_id = ?2",
-        None => "SELECT id, title, body, status, priority, position, created_at, updated_at
-                  FROM tasks WHERE id = ?1",
+        Some(_) => format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1 AND board_id = ?2"),
+        None => format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"),
     };
     let raw: Result<RawTaskRow, rusqlite::Error> = if let Some(bid) = board_id {
-        conn.query_row(sql, rusqlite::params![id, bid], row_to_raw_task)
+        conn.query_row(&sql, rusqlite::params![id, bid], row_to_raw_task)
     } else {
-        conn.query_row(sql, rusqlite::params![id], row_to_raw_task)
+        conn.query_row(&sql, rusqlite::params![id], row_to_raw_task)
     };
     match raw {
-        Ok(r) => task_from_parts(board_id, r),
+        Ok(r) => {
+            let mut task = task_from_parts(board_id, r)?;
+            task.tags = tags_for_task_ids(conn, &[id])?.remove(&id).unwrap_or_default();
+            Ok(task)
+        }
         Err(rusqlite::Error::QueryReturnedNoRows) => Err(StorageError::NotFound),
         Err(e) => Err(e.into()),
     }
@@ -91,14 +177,33 @@ pub(crate) fn create_task(conn: &Connection, board_id: Option<BoardId>, draft: N
     };
     match board_id {
         Some(bid) => conn.execute(
-            "INSERT INTO tasks (board_id, title, body, status, priority, position, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-            rusqlite::params![bid, draft.title, draft.body, draft.status.as_str(), draft.priority.as_str(), next_position, now],
+            "INSERT INTO tasks (board_id, title, body, status, priority, position, created_at, updated_at, start_date, deadline)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9)",
+            rusqlite::params![
+                bid,
+                draft.title,
+                draft.body,
+                draft.status.as_str(),
+                draft.priority.as_str(),
+                next_position,
+                now,
+                draft.start_date,
+                draft.deadline
+            ],
         )?,
         None => conn.execute(
-            "INSERT INTO tasks (title, body, status, priority, position, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-            rusqlite::params![draft.title, draft.body, draft.status.as_str(), draft.priority.as_str(), next_position, now],
+            "INSERT INTO tasks (title, body, status, priority, position, created_at, updated_at, start_date, deadline)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8)",
+            rusqlite::params![
+                draft.title,
+                draft.body,
+                draft.status.as_str(),
+                draft.priority.as_str(),
+                next_position,
+                now,
+                draft.start_date,
+                draft.deadline
+            ],
         )?,
     };
     Ok(conn.last_insert_rowid())
@@ -123,6 +228,14 @@ pub(crate) fn update_task(conn: &Connection, board_id: Option<BoardId>, id: Task
     if let Some(priority) = patch.priority {
         set_clauses.push("priority = ?");
         values.push(Box::new(priority.as_str()));
+    }
+    if let Some(start_date) = patch.start_date {
+        set_clauses.push("start_date = ?");
+        values.push(Box::new(start_date));
+    }
+    if let Some(deadline) = patch.deadline {
+        set_clauses.push("deadline = ?");
+        values.push(Box::new(deadline));
     }
     set_clauses.push("updated_at = ?");
     values.push(Box::new(chrono::Utc::now().timestamp()));
@@ -367,4 +480,247 @@ pub(crate) fn promote_note(conn: &Connection, board_id: Option<BoardId>, id: Not
 
     tx.commit()?;
     Ok(task_id)
+}
+
+fn row_to_tag(row: &rusqlite::Row) -> rusqlite::Result<Tag> {
+    Ok(Tag { id: row.get(0)?, name: row.get(1)?, color: row.get(2)? })
+}
+
+pub(crate) fn list_tags(conn: &Connection, board_id: Option<BoardId>) -> Result<Vec<Tag>, StorageError> {
+    let sql = match board_id {
+        Some(_) => "SELECT id, name, color FROM tags WHERE board_id = ?1 ORDER BY name",
+        None => "SELECT id, name, color FROM tags ORDER BY name",
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows: Vec<Tag> = if let Some(bid) = board_id {
+        stmt.query_map(rusqlite::params![bid], row_to_tag)?.collect::<Result<_, _>>()?
+    } else {
+        stmt.query_map([], row_to_tag)?.collect::<Result<_, _>>()?
+    };
+    Ok(rows)
+}
+
+/// Idempotent per board: a duplicate `name` returns the existing tag's id
+/// (updating its color) rather than erroring or duplicating the row.
+/// Rejects an empty or whitespace-only name.
+pub(crate) fn upsert_tag(conn: &Connection, board_id: Option<BoardId>, name: &str, color: Option<&str>) -> Result<TagId, StorageError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(StorageError::EmptyTagName);
+    }
+    match board_id {
+        Some(bid) => {
+            conn.execute(
+                "INSERT INTO tags (board_id, name, color) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(board_id, name) DO UPDATE SET color = excluded.color",
+                rusqlite::params![bid, trimmed, color],
+            )?;
+            let id: TagId = conn.query_row(
+                "SELECT id FROM tags WHERE board_id = ?1 AND name = ?2",
+                rusqlite::params![bid, trimmed],
+                |row| row.get(0),
+            )?;
+            Ok(id)
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO tags (name, color) VALUES (?1, ?2)
+                 ON CONFLICT(name) DO UPDATE SET color = excluded.color",
+                rusqlite::params![trimmed, color],
+            )?;
+            let id: TagId =
+                conn.query_row("SELECT id FROM tags WHERE name = ?1", rusqlite::params![trimmed], |row| row.get(0))?;
+            Ok(id)
+        }
+    }
+}
+
+pub(crate) fn rename_tag(conn: &Connection, board_id: Option<BoardId>, id: TagId, new_name: &str) -> Result<(), StorageError> {
+    let trimmed = new_name.trim();
+    if trimmed.is_empty() {
+        return Err(StorageError::EmptyTagName);
+    }
+    let sql = match board_id {
+        Some(_) => "UPDATE tags SET name = ?1 WHERE id = ?2 AND board_id = ?3",
+        None => "UPDATE tags SET name = ?1 WHERE id = ?2",
+    };
+    let changed = match board_id {
+        Some(bid) => conn.execute(sql, rusqlite::params![trimmed, id, bid])?,
+        None => conn.execute(sql, rusqlite::params![trimmed, id])?,
+    };
+    if changed == 0 {
+        return Err(StorageError::NotFound);
+    }
+    Ok(())
+}
+
+pub(crate) fn delete_tag(conn: &Connection, board_id: Option<BoardId>, id: TagId) -> Result<(), StorageError> {
+    let sql = match board_id {
+        Some(_) => "DELETE FROM tags WHERE id = ?1 AND board_id = ?2",
+        None => "DELETE FROM tags WHERE id = ?1",
+    };
+    let changed = match board_id {
+        Some(bid) => conn.execute(sql, rusqlite::params![id, bid])?,
+        None => conn.execute(sql, rusqlite::params![id])?,
+    };
+    if changed == 0 {
+        return Err(StorageError::NotFound);
+    }
+    Ok(())
+}
+
+pub(crate) fn tags_for_task(conn: &Connection, task_id: TaskId) -> Result<Vec<Tag>, StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT t.id, t.name, t.color FROM tags t
+         JOIN task_tags tt ON tt.tag_id = t.id
+         WHERE tt.task_id = ?1 ORDER BY t.name",
+    )?;
+    let rows: Vec<Tag> = stmt.query_map(rusqlite::params![task_id], row_to_tag)?.collect::<Result<_, _>>()?;
+    Ok(rows)
+}
+
+/// Replaces the whole tag set for `task_id` with exactly `tag_ids`.
+pub(crate) fn set_task_tags(conn: &Connection, task_id: TaskId, tag_ids: &[TagId]) -> Result<(), StorageError> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM task_tags WHERE task_id = ?1", rusqlite::params![task_id])?;
+    for tag_id in tag_ids {
+        tx.execute(
+            "INSERT OR IGNORE INTO task_tags (task_id, tag_id) VALUES (?1, ?2)",
+            rusqlite::params![task_id, tag_id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod shared_tests {
+    //! Assertions run against a `&dyn TaskStore` so `main_db` and
+    //! `locked_db` can each set up their own store and share one test body,
+    //! per the acceptance bar's "share the test bodies if practical".
+    use crate::domain::task::{NewTask, Priority, Status, TaskPatch};
+    use crate::storage::TaskStore;
+
+    fn new_task(title: &str) -> NewTask {
+        NewTask {
+            title: title.into(),
+            body: String::new(),
+            status: Status::ToDo,
+            priority: Priority::Normal,
+            start_date: None,
+            deadline: None,
+        }
+    }
+
+    pub(crate) fn create_read_task_with_and_without_dates(store: &dyn TaskStore) {
+        let plain_id = store.create_task(new_task("no dates")).unwrap();
+        let plain = store.get_task(plain_id).unwrap();
+        assert_eq!(plain.start_date, None);
+        assert_eq!(plain.deadline, None);
+
+        let dated_id = store
+            .create_task(NewTask {
+                start_date: Some(1_000),
+                deadline: Some(2_000),
+                ..new_task("with dates")
+            })
+            .unwrap();
+        let dated = store.get_task(dated_id).unwrap();
+        assert_eq!(dated.start_date, Some(1_000));
+        assert_eq!(dated.deadline, Some(2_000));
+    }
+
+    pub(crate) fn clear_deadline_via_patch_leaves_title_untouched(store: &dyn TaskStore) {
+        let id = store
+            .create_task(NewTask { deadline: Some(5_000), ..new_task("keep my title") })
+            .unwrap();
+
+        store
+            .update_task(id, TaskPatch { deadline: Some(None), ..Default::default() })
+            .unwrap();
+
+        let after = store.get_task(id).unwrap();
+        assert_eq!(after.deadline, None);
+        assert_eq!(after.title, "keep my title");
+    }
+
+    pub(crate) fn tag_upsert_is_idempotent_and_rejects_empty_name(store: &dyn TaskStore) {
+        let id1 = store.upsert_tag("urgent", Some("#ff0000")).unwrap();
+        let id2 = store.upsert_tag("urgent", Some("#00ff00")).unwrap();
+        assert_eq!(id1, id2, "upserting a duplicate name must return the same tag id");
+
+        let tags = store.list_tags().unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].color.as_deref(), Some("#00ff00"));
+
+        assert!(matches!(store.upsert_tag("", None), Err(crate::storage::StorageError::EmptyTagName)));
+        assert!(matches!(store.upsert_tag("   ", None), Err(crate::storage::StorageError::EmptyTagName)));
+    }
+
+    pub(crate) fn tag_rename_and_delete(store: &dyn TaskStore) {
+        let id = store.upsert_tag("temp", None).unwrap();
+        store.rename_tag(id, "renamed").unwrap();
+        let tags = store.list_tags().unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].name, "renamed");
+
+        store.delete_tag(id).unwrap();
+        assert!(store.list_tags().unwrap().is_empty());
+    }
+
+    pub(crate) fn set_task_tags_replaces_whole_set_and_reads_back(store: &dyn TaskStore) {
+        let task_id = store.create_task(new_task("tagged task")).unwrap();
+        let a = store.upsert_tag("a", None).unwrap();
+        let b = store.upsert_tag("b", None).unwrap();
+        let c = store.upsert_tag("c", None).unwrap();
+
+        store.set_task_tags(task_id, &[a, b]).unwrap();
+        let mut names: Vec<String> = store.tags_for_task(task_id).unwrap().into_iter().map(|t| t.name).collect();
+        names.sort();
+        assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+
+        store.set_task_tags(task_id, &[c]).unwrap();
+        let names: Vec<String> = store.tags_for_task(task_id).unwrap().into_iter().map(|t| t.name).collect();
+        assert_eq!(names, vec!["c".to_string()]);
+
+        store.set_task_tags(task_id, &[]).unwrap();
+        assert!(store.tags_for_task(task_id).unwrap().is_empty());
+    }
+
+    pub(crate) fn deleting_task_cascades_its_tags(store: &dyn TaskStore) {
+        let task_id = store.create_task(new_task("will be deleted")).unwrap();
+        let tag_id = store.upsert_tag("keep-me", None).unwrap();
+        store.set_task_tags(task_id, &[tag_id]).unwrap();
+        assert_eq!(store.tags_for_task(task_id).unwrap().len(), 1);
+
+        store.delete_task(task_id).unwrap();
+
+        // The tag itself survives; only the junction row for this task is gone.
+        assert_eq!(store.list_tags().unwrap().len(), 1);
+        // The task is gone, so re-querying its tags must not resurrect it or panic.
+        assert!(store.tags_for_task(task_id).unwrap().is_empty());
+    }
+
+    pub(crate) fn tags_load_with_list_tasks_for_many_tasks(store: &dyn TaskStore) {
+        let shared_tag = store.upsert_tag("shared", None).unwrap();
+        let mut expected_own_tag_names = Vec::new();
+        for i in 0..20 {
+            let id = store.create_task(new_task(&format!("task {i}"))).unwrap();
+            let own_tag_name = format!("own-{i}");
+            let own_tag = store.upsert_tag(&own_tag_name, None).unwrap();
+            store.set_task_tags(id, &[shared_tag, own_tag]).unwrap();
+            expected_own_tag_names.push(own_tag_name);
+        }
+
+        let tasks = store.list_tasks(Status::ToDo).unwrap();
+        assert_eq!(tasks.len(), 20);
+        for task in &tasks {
+            let mut names: Vec<&str> = task.tags.iter().map(|t| t.name.as_str()).collect();
+            names.sort();
+            assert_eq!(names.len(), 2);
+            assert!(names.contains(&"shared"));
+            let expected_own = format!("own-{}", task.title.trim_start_matches("task "));
+            assert!(names.contains(&expected_own.as_str()), "task {} missing its own tag", task.title);
+        }
+    }
 }

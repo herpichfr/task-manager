@@ -23,7 +23,7 @@ use std::path::Path;
 use rusqlite::Connection;
 
 use crate::domain::note::{Note, NoteId};
-use crate::domain::task::{NewTask, Status, Task, TaskId, TaskPatch};
+use crate::domain::task::{NewTask, Status, Tag, TagId, Task, TaskId, TaskPatch};
 use crate::storage::task_store_impl as shared;
 use crate::storage::{migrations, StorageError, TaskStore};
 
@@ -135,6 +135,24 @@ impl<'a> TaskStore for LockedBoardStore<'a> {
     fn promote_note(&self, id: NoteId, status: Status) -> Result<TaskId, StorageError> {
         shared::promote_note(self.conn, None, id, status)
     }
+    fn list_tags(&self) -> Result<Vec<Tag>, StorageError> {
+        shared::list_tags(self.conn, None)
+    }
+    fn upsert_tag(&self, name: &str, color: Option<&str>) -> Result<TagId, StorageError> {
+        shared::upsert_tag(self.conn, None, name, color)
+    }
+    fn rename_tag(&self, id: TagId, new_name: &str) -> Result<(), StorageError> {
+        shared::rename_tag(self.conn, None, id, new_name)
+    }
+    fn delete_tag(&self, id: TagId) -> Result<(), StorageError> {
+        shared::delete_tag(self.conn, None, id)
+    }
+    fn tags_for_task(&self, id: TaskId) -> Result<Vec<Tag>, StorageError> {
+        shared::tags_for_task(self.conn, id)
+    }
+    fn set_task_tags(&self, id: TaskId, tags: &[TagId]) -> Result<(), StorageError> {
+        shared::set_task_tags(self.conn, id, tags)
+    }
 }
 
 #[cfg(test)]
@@ -142,6 +160,7 @@ mod tests {
     use super::*;
     use crate::crypto::{self, Kdf};
     use crate::domain::task::Priority;
+    use crate::storage::task_store_impl::shared_tests;
 
     fn tiny_kdf() -> Kdf {
         Kdf { m_cost: 8, t_cost: 1, p_cost: 1 }
@@ -168,6 +187,8 @@ mod tests {
                     body: String::new(),
                     status: Status::ToDo,
                     priority: Priority::Normal,
+                    start_date: None,
+                    deadline: None,
                 })
                 .unwrap();
         }
@@ -232,6 +253,8 @@ mod tests {
                     body: String::new(),
                     status: Status::ToDo,
                     priority: Priority::Normal,
+                    start_date: None,
+                    deadline: None,
                 })
                 .unwrap();
         }
@@ -252,13 +275,13 @@ mod tests {
         let store = db.store();
 
         let a = store
-            .create_task(NewTask { title: "a".into(), body: String::new(), status: Status::ToDo, priority: Priority::Normal })
+            .create_task(NewTask { title: "a".into(), body: String::new(), status: Status::ToDo, priority: Priority::Normal, start_date: None, deadline: None })
             .unwrap();
         let b = store
-            .create_task(NewTask { title: "b".into(), body: String::new(), status: Status::ToDo, priority: Priority::Normal })
+            .create_task(NewTask { title: "b".into(), body: String::new(), status: Status::ToDo, priority: Priority::Normal, start_date: None, deadline: None })
             .unwrap();
         let c = store
-            .create_task(NewTask { title: "c".into(), body: String::new(), status: Status::ToDo, priority: Priority::Normal })
+            .create_task(NewTask { title: "c".into(), body: String::new(), status: Status::ToDo, priority: Priority::Normal, start_date: None, deadline: None })
             .unwrap();
 
         store.move_task(a, Status::Doing, 0).unwrap();
@@ -281,5 +304,75 @@ mod tests {
         let task = store.get_task(task_id).unwrap();
         assert_eq!(task.title, "Buy milk");
         assert_eq!(task.body, "and eggs");
+    }
+
+    #[test]
+    fn create_read_task_with_and_without_dates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.db");
+        let salt = crypto::generate_salt();
+        let key_hex = key_hex_for("hunter2", &salt);
+        let db = LockedDb::create(&path, &key_hex, "vault").unwrap();
+        shared_tests::create_read_task_with_and_without_dates(&db.store());
+    }
+
+    #[test]
+    fn clear_deadline_via_patch_leaves_title_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.db");
+        let salt = crypto::generate_salt();
+        let key_hex = key_hex_for("hunter2", &salt);
+        let db = LockedDb::create(&path, &key_hex, "vault").unwrap();
+        shared_tests::clear_deadline_via_patch_leaves_title_untouched(&db.store());
+    }
+
+    #[test]
+    fn tag_upsert_is_idempotent_and_rejects_empty_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.db");
+        let salt = crypto::generate_salt();
+        let key_hex = key_hex_for("hunter2", &salt);
+        let db = LockedDb::create(&path, &key_hex, "vault").unwrap();
+        shared_tests::tag_upsert_is_idempotent_and_rejects_empty_name(&db.store());
+    }
+
+    #[test]
+    fn tag_rename_and_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.db");
+        let salt = crypto::generate_salt();
+        let key_hex = key_hex_for("hunter2", &salt);
+        let db = LockedDb::create(&path, &key_hex, "vault").unwrap();
+        shared_tests::tag_rename_and_delete(&db.store());
+    }
+
+    #[test]
+    fn set_task_tags_replaces_whole_set_and_reads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.db");
+        let salt = crypto::generate_salt();
+        let key_hex = key_hex_for("hunter2", &salt);
+        let db = LockedDb::create(&path, &key_hex, "vault").unwrap();
+        shared_tests::set_task_tags_replaces_whole_set_and_reads_back(&db.store());
+    }
+
+    #[test]
+    fn deleting_task_cascades_its_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.db");
+        let salt = crypto::generate_salt();
+        let key_hex = key_hex_for("hunter2", &salt);
+        let db = LockedDb::create(&path, &key_hex, "vault").unwrap();
+        shared_tests::deleting_task_cascades_its_tags(&db.store());
+    }
+
+    #[test]
+    fn tags_load_with_list_tasks_for_many_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.db");
+        let salt = crypto::generate_salt();
+        let key_hex = key_hex_for("hunter2", &salt);
+        let db = LockedDb::create(&path, &key_hex, "vault").unwrap();
+        shared_tests::tags_load_with_list_tasks_for_many_tasks(&db.store());
     }
 }

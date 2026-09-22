@@ -1,7 +1,7 @@
 //! The popup stack: dropdowns, the task/note form, confirmation prompts,
-//! the passphrase prompt, and the help screen. Every key press, while any
-//! popup is open, is routed to the top of this stack rather than to the
-//! keymap.
+//! the passphrase prompt, the tag picker, one-line text prompts, and the
+//! help screen. Every key press, while any popup is open, is routed to the
+//! top of this stack rather than to the keymap.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph};
 use ratatui::Frame;
 
+use crate::domain::task::{Status, Tag, TagId, TaskId};
 use crate::ui::forms::{Field, FormState, TaskDraft};
 use crate::ui::theme::Styles;
 
@@ -19,6 +20,8 @@ pub enum Popup {
     Form(FormState),
     Confirm(ConfirmState),
     Passphrase(PassphraseState),
+    TagPicker(TagPickerState),
+    TextPrompt(TextPromptState),
     Help,
 }
 
@@ -35,6 +38,10 @@ pub enum PopupOutcome {
     /// top of the stack (via `receive`) or, if the stack is now empty, to
     /// the caller holding the stack.
     Submit(PopupValue),
+    /// A tag picker in-place action: unlike `Submit`, this never pops the
+    /// tag picker off the stack (a `Toggle`); the caller decides whether
+    /// `New`/`Rename`/`Delete` replace it with a text prompt or confirm.
+    TagPicker(TagPickerAction),
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +50,11 @@ pub enum PopupValue {
     Form(TaskDraft),
     Confirmed(bool),
     Passphrase(String),
+    /// A one-line `TextPrompt`'s submitted text (new-tag name, rename-tag
+    /// name, or a quick-capture note body -- which of those it is comes
+    /// from whatever `PendingPopupAction` the caller had recorded before
+    /// pushing the prompt).
+    Text(String),
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +77,7 @@ pub enum DropdownTarget {
     Priority,
     Tag,
     Board,
+    Status,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +96,40 @@ pub struct PassphraseState {
     pub error: Option<String>,
 }
 
+/// A one-line, unmasked text prompt: new-tag name, rename-tag name, and
+/// note quick-capture all use this same popup, distinguished only by which
+/// `PendingPopupAction` `App` recorded before pushing it.
+#[derive(Debug, Clone)]
+pub struct TextPromptState {
+    pub prompt: String,
+    pub input: String,
+    pub error: Option<String>,
+}
+
+/// The board's tags for one task: navigable as `tags` rows plus a final
+/// "+ new tag…" row. `applied` holds the ids currently on `task_id`, shown
+/// with a `*` marker; Enter on a tag row toggles membership immediately
+/// (persisted by `App`, which then refreshes `applied` in place) without
+/// closing the picker, so several tags can be toggled in one sitting.
+#[derive(Debug, Clone)]
+pub struct TagPickerState {
+    pub task_id: TaskId,
+    pub tags: Vec<Tag>,
+    pub applied: Vec<TagId>,
+    pub selected: usize,
+}
+
+/// What a key press on the tag picker asks `App` to do. `Toggle` is
+/// handled in place (the picker stays open); `New`/`Rename`/`Delete` ask
+/// `App` to replace the picker with a text prompt or a confirmation.
+#[derive(Debug, Clone, Copy)]
+pub enum TagPickerAction {
+    Toggle(TagId),
+    New,
+    Rename(TagId),
+    Delete(TagId),
+}
+
 impl Popup {
     pub fn handle_key(&mut self, key: KeyEvent) -> PopupOutcome {
         match self {
@@ -90,13 +137,16 @@ impl Popup {
             Popup::Form(f) => f.handle_key(key),
             Popup::Confirm(_) => handle_confirm_key(key),
             Popup::Passphrase(p) => handle_passphrase_key(p, key),
+            Popup::TagPicker(t) => handle_tag_picker_key(t, key),
+            Popup::TextPrompt(p) => handle_text_prompt_key(p, key),
             Popup::Help => PopupOutcome::Close,
         }
     }
 
     /// Feeds a value submitted by a child popup into this one. Only a
-    /// `Form` currently has children (its priority/tag dropdowns); the
-    /// others ignore it.
+    /// `Form` currently has children (its priority/status/tag dropdowns);
+    /// the others ignore it. The tag picker's own new/rename/delete flow
+    /// does not nest this way -- see `TagPickerAction`.
     pub fn receive(&mut self, value: PopupValue) {
         if let Popup::Form(f) = self {
             f.receive(value);
@@ -161,6 +211,60 @@ fn handle_passphrase_key(p: &mut PassphraseState, key: KeyEvent) -> PopupOutcome
     PopupOutcome::Consumed
 }
 
+fn handle_text_prompt_key(p: &mut TextPromptState, key: KeyEvent) -> PopupOutcome {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if key.code == KeyCode::Esc || (ctrl && key.code == KeyCode::Char('c')) {
+        return PopupOutcome::Close;
+    }
+    match key.code {
+        KeyCode::Enter => return PopupOutcome::Submit(PopupValue::Text(std::mem::take(&mut p.input))),
+        KeyCode::Backspace => {
+            p.input.pop();
+            p.error = None;
+        }
+        KeyCode::Char(c) => {
+            p.input.push(c);
+            p.error = None;
+        }
+        _ => {}
+    }
+    PopupOutcome::Consumed
+}
+
+/// `j/k`/`gg`/`G` navigate the tag rows plus the trailing "+ new tag…" row;
+/// Enter toggles a tag (or, on the last row, starts the new-tag flow); `r`
+/// renames and `d` deletes the highlighted tag (both no-ops on the "+ new
+/// tag…" row, since it names no existing tag).
+fn handle_tag_picker_key(t: &mut TagPickerState, key: KeyEvent) -> PopupOutcome {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if key.code == KeyCode::Esc || (ctrl && key.code == KeyCode::Char('c')) {
+        return PopupOutcome::Close;
+    }
+    let len = t.tags.len() + 1;
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => t.selected = (t.selected + 1) % len,
+        KeyCode::Char('k') | KeyCode::Up => {
+            t.selected = if t.selected == 0 { len - 1 } else { t.selected - 1 };
+        }
+        KeyCode::Char('g') => t.selected = 0,
+        KeyCode::Char('G') => t.selected = len - 1,
+        KeyCode::Enter => {
+            if t.selected >= t.tags.len() {
+                return PopupOutcome::TagPicker(TagPickerAction::New);
+            }
+            return PopupOutcome::TagPicker(TagPickerAction::Toggle(t.tags[t.selected].id));
+        }
+        KeyCode::Char('r') if t.selected < t.tags.len() => {
+            return PopupOutcome::TagPicker(TagPickerAction::Rename(t.tags[t.selected].id));
+        }
+        KeyCode::Char('d') if t.selected < t.tags.len() => {
+            return PopupOutcome::TagPicker(TagPickerAction::Delete(t.tags[t.selected].id));
+        }
+        _ => {}
+    }
+    PopupOutcome::Consumed
+}
+
 /// Returns a `width` x `height` rectangle centred within `area`, clamped so
 /// it always fits inside `area` even when `area` is smaller than the
 /// requested size.
@@ -192,6 +296,8 @@ fn render_one(frame: &mut Frame, area: Rect, popup: &Popup, styles: &Styles) {
         Popup::Form(f) => render_form(frame, area, f, styles),
         Popup::Confirm(c) => render_confirm(frame, area, c, styles),
         Popup::Passphrase(p) => render_passphrase(frame, area, p, styles),
+        Popup::TagPicker(t) => render_tag_picker(frame, area, t, styles),
+        Popup::TextPrompt(p) => render_text_prompt(frame, area, p, styles),
         Popup::Help => render_help(frame, area, styles),
     }
 }
@@ -223,11 +329,22 @@ fn render_dropdown(frame: &mut Frame, area: Rect, d: &DropdownState, styles: &St
     frame.render_widget(List::new(items).block(block), rect);
 }
 
+fn status_text(status: Status) -> &'static str {
+    match status {
+        Status::ToDo => "ToDo",
+        Status::Doing => "Doing",
+        Status::Done => "Done",
+    }
+}
+
 fn field_label(field: Field, is_note: bool) -> &'static str {
     match field {
         Field::Title => "Title",
+        Field::Status => "Status",
         Field::Priority => "Priority",
         Field::Tags => "Tags",
+        Field::Start => "Start",
+        Field::Deadline => "Deadline",
         Field::Body => {
             if is_note {
                 "Body"
@@ -240,7 +357,7 @@ fn field_label(field: Field, is_note: bool) -> &'static str {
 
 fn render_form(frame: &mut Frame, area: Rect, f: &FormState, styles: &Styles) {
     let width = 60u16.min(area.width.max(10));
-    let height = if f.is_note() { 8u16 } else { 10u16 }.min(area.height.max(6));
+    let height = if f.is_note() { 8u16 } else { 14u16 }.min(area.height.max(6));
     let rect = centered_rect(width, height, area);
 
     let title = match f.kind {
@@ -260,12 +377,24 @@ fn render_form(frame: &mut Frame, area: Rect, f: &FormState, styles: &Styles) {
     ]));
     if !f.is_note() {
         lines.push(Line::from(vec![
+            Span::styled(format!("{}: ", field_label(Field::Status, false)), field_style(Field::Status)),
+            Span::styled(status_text(f.status), styles.default),
+        ]));
+        lines.push(Line::from(vec![
             Span::styled(format!("{}: ", field_label(Field::Priority, false)), field_style(Field::Priority)),
             Span::styled(f.priority.as_str(), styles.default),
         ]));
         lines.push(Line::from(vec![
             Span::styled(format!("{}: ", field_label(Field::Tags, false)), field_style(Field::Tags)),
             Span::styled(f.tags.join(", "), styles.default),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(format!("{}: ", field_label(Field::Start, false)), field_style(Field::Start)),
+            Span::styled(f.start_text.clone(), styles.default),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(format!("{}: ", field_label(Field::Deadline, false)), field_style(Field::Deadline)),
+            Span::styled(f.deadline_text.clone(), styles.default),
         ]));
     }
     lines.push(Line::from(Span::styled(
@@ -317,6 +446,60 @@ fn render_passphrase(frame: &mut Frame, area: Rect, p: &PassphraseState, styles:
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+fn render_text_prompt(frame: &mut Frame, area: Rect, p: &TextPromptState, styles: &Styles) {
+    let width = (p.prompt.chars().count().max(p.input.chars().count()) as u16 + 4)
+        .max(24)
+        .min(area.width.max(4));
+    let height = if p.error.is_some() { 4 } else { 3 }.min(area.height.max(3));
+    let rect = centered_rect(width, height, area);
+    let block = Block::bordered().title(Line::from(format!(" {} ", p.prompt))).border_style(styles.border);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(block.clone(), rect);
+    let inner = block.inner(rect);
+
+    let mut lines = vec![Line::from(p.input.clone())];
+    if let Some(err) = &p.error {
+        lines.push(Line::from(Span::styled(err.clone(), styles.priority_urgent)));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_tag_picker(frame: &mut Frame, area: Rect, t: &TagPickerState, styles: &Styles) {
+    let mut labels: Vec<String> = t
+        .tags
+        .iter()
+        .map(|tag| {
+            let marker = if t.applied.contains(&tag.id) { "* " } else { "  " };
+            format!("{marker}{}", tag.name)
+        })
+        .collect();
+    labels.push("  + new tag…".to_string());
+
+    let width = labels
+        .iter()
+        .map(|l| l.chars().count() as u16 + 4)
+        .max()
+        .unwrap_or(10)
+        .max(20);
+    let height = (labels.len() as u16 + 2).max(3);
+    let rect = centered_rect(width, height, area);
+
+    let items: Vec<ListItem> = labels
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            let style = if i == t.selected { styles.selection } else { styles.default };
+            ListItem::new(Line::from(Span::styled(label.clone(), style)))
+        })
+        .collect();
+
+    let block = Block::bordered()
+        .title(Line::from(" Tags (Enter toggle, r rename, d delete) "))
+        .border_style(styles.border);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(List::new(items).block(block), rect);
+}
+
 fn render_help(frame: &mut Frame, area: Rect, styles: &Styles) {
     let rect = centered_rect(50, 12, area);
     let block = Block::bordered().title(Line::from(" Help ")).border_style(styles.border);
@@ -349,6 +532,18 @@ mod tests {
             ],
             selected: 0,
             target: DropdownTarget::Column,
+        }
+    }
+
+    fn sample_tag_picker() -> TagPickerState {
+        TagPickerState {
+            task_id: 1,
+            tags: vec![
+                Tag { id: 10, name: "home".to_string(), color: None },
+                Tag { id: 11, name: "work".to_string(), color: None },
+            ],
+            applied: vec![10],
+            selected: 0,
         }
     }
 
@@ -447,6 +642,84 @@ mod tests {
         assert!(matches!(handle_passphrase_key(&mut p, key(KeyCode::Esc)), PopupOutcome::Close));
     }
 
+    #[test]
+    fn text_prompt_enter_submits_typed_text() {
+        let mut p = TextPromptState { prompt: "New tag name".to_string(), input: "urgent".to_string(), error: None };
+        match handle_text_prompt_key(&mut p, key(KeyCode::Enter)) {
+            PopupOutcome::Submit(PopupValue::Text(s)) => assert_eq!(s, "urgent"),
+            other => panic!("expected Submit(Text(..)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_prompt_esc_closes() {
+        let mut p = TextPromptState { prompt: "New tag name".to_string(), input: String::new(), error: None };
+        assert!(matches!(handle_text_prompt_key(&mut p, key(KeyCode::Esc)), PopupOutcome::Close));
+    }
+
+    // --- tag picker --------------------------------------------------------
+
+    #[test]
+    fn tag_picker_enter_on_tag_row_toggles() {
+        let mut t = sample_tag_picker();
+        match handle_tag_picker_key(&mut t, key(KeyCode::Enter)) {
+            PopupOutcome::TagPicker(TagPickerAction::Toggle(id)) => assert_eq!(id, 10),
+            other => panic!("expected TagPicker(Toggle), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tag_picker_enter_on_new_row_starts_new_tag_flow() {
+        let mut t = sample_tag_picker();
+        t.selected = t.tags.len(); // the trailing "+ new tag…" row
+        match handle_tag_picker_key(&mut t, key(KeyCode::Enter)) {
+            PopupOutcome::TagPicker(TagPickerAction::New) => {}
+            other => panic!("expected TagPicker(New), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tag_picker_r_renames_highlighted_tag() {
+        let mut t = sample_tag_picker();
+        t.selected = 1;
+        match handle_tag_picker_key(&mut t, key(KeyCode::Char('r'))) {
+            PopupOutcome::TagPicker(TagPickerAction::Rename(id)) => assert_eq!(id, 11),
+            other => panic!("expected TagPicker(Rename), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tag_picker_d_deletes_highlighted_tag() {
+        let mut t = sample_tag_picker();
+        match handle_tag_picker_key(&mut t, key(KeyCode::Char('d'))) {
+            PopupOutcome::TagPicker(TagPickerAction::Delete(id)) => assert_eq!(id, 10),
+            other => panic!("expected TagPicker(Delete), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tag_picker_r_and_d_are_noops_on_the_new_tag_row() {
+        let mut t = sample_tag_picker();
+        t.selected = t.tags.len();
+        assert!(matches!(handle_tag_picker_key(&mut t, key(KeyCode::Char('r'))), PopupOutcome::Consumed));
+        assert!(matches!(handle_tag_picker_key(&mut t, key(KeyCode::Char('d'))), PopupOutcome::Consumed));
+    }
+
+    #[test]
+    fn tag_picker_navigation_wraps_across_the_new_tag_row() {
+        let mut t = sample_tag_picker();
+        handle_tag_picker_key(&mut t, key(KeyCode::Char('k')));
+        assert_eq!(t.selected, 2); // wraps to the "+ new tag…" row
+        handle_tag_picker_key(&mut t, key(KeyCode::Char('j')));
+        assert_eq!(t.selected, 0);
+    }
+
+    #[test]
+    fn tag_picker_esc_closes() {
+        let mut t = sample_tag_picker();
+        assert!(matches!(handle_tag_picker_key(&mut t, key(KeyCode::Esc)), PopupOutcome::Close));
+    }
+
     // --- stack-nesting behaviour (the highest-risk logic) ----------------
     //
     // These drive a small local stack the same way `App` does, to
@@ -466,6 +739,7 @@ mod tests {
                     top.receive(value);
                 }
             }
+            PopupOutcome::TagPicker(_) => {}
         }
     }
 

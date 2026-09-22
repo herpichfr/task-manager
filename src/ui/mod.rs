@@ -52,6 +52,8 @@ mod tests {
                             body: String::new(),
                             status,
                             priority: Priority::Normal,
+                            start_date: None,
+                            deadline: None,
                         })
                         .unwrap();
                 }

@@ -7,9 +7,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, Paragraph};
 use ratatui::Frame;
 
-use crate::app::App;
+use crate::app::{note_matches_query, task_matches_query, App};
 use crate::domain::board::BoardKind;
-use crate::domain::task::{Priority, Status};
+use crate::domain::dates;
+use crate::domain::task::{Priority, Status, Task};
 use crate::ui::theme::Styles;
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App, styles: &Styles) {
@@ -33,12 +34,14 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, styles: &Styles) {
 
     let cols = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(board_area);
 
+    let now = chrono::Local::now().timestamp();
+    let query = app.search_query();
     for (idx, status) in Status::ALL.iter().enumerate() {
-        render_column(frame, cols[idx], app, styles, *status, idx);
+        render_column(frame, cols[idx], app, styles, *status, idx, now, query.as_deref());
     }
 
     if let Some(notes_rect) = notes_area {
-        render_notes(frame, notes_rect, app, styles);
+        render_notes(frame, notes_rect, app, styles, query.as_deref());
     }
 }
 
@@ -50,15 +53,6 @@ fn status_label_and_style(status: Status, styles: &Styles) -> (&'static str, rat
     }
 }
 
-fn priority_style(priority: Priority, styles: &Styles) -> ratatui::style::Style {
-    match priority {
-        Priority::Low => styles.priority_low,
-        Priority::Normal => styles.priority_normal,
-        Priority::High => styles.priority_high,
-        Priority::Urgent => styles.priority_urgent,
-    }
-}
-
 fn priority_marker(priority: Priority) -> &'static str {
     match priority {
         Priority::Urgent => "!! ",
@@ -67,32 +61,77 @@ fn priority_marker(priority: Priority) -> &'static str {
     }
 }
 
-fn render_column(frame: &mut Frame, area: Rect, app: &App, styles: &Styles, status: Status, idx: usize) {
+/// Builds one card's rendered line: `{priority marker}{title [+tags]}`,
+/// left-aligned and truncated with an ellipsis exactly as before this
+/// phase, plus -- new in this phase -- a right-aligned compact deadline
+/// badge (`3d`, `12d`, `-2d` once overdue) fit into the remaining width.
+/// A task with no deadline gets no badge and behaves exactly as before.
+fn card_line_text(task: &Task, inner_width: usize, now: i64) -> String {
+    let marker = priority_marker(task.priority);
+    let badge = task.deadline.map(|d| format!("{}d", dates::days_until(d, now)));
+    let badge_w = badge.as_deref().map(|s| s.chars().count()).unwrap_or(0);
+    let reserve = if badge_w > 0 { badge_w + 1 } else { 0 };
+    let left_budget = inner_width.saturating_sub(marker.chars().count()).saturating_sub(reserve);
+
+    let mut left_content = task.title.clone();
+    if !task.tags.is_empty() {
+        let tag_str = task.tags.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(",");
+        left_content.push_str(" [");
+        left_content.push_str(&tag_str);
+        left_content.push(']');
+    }
+    let left_trunc = truncate_with_ellipsis(&left_content, left_budget);
+
+    let used = marker.chars().count() + left_trunc.chars().count();
+    let mut line = format!("{marker}{left_trunc}");
+    if let Some(badge) = badge {
+        let pad = inner_width.saturating_sub(used).saturating_sub(badge_w);
+        line.push_str(&" ".repeat(pad));
+        line.push_str(&badge);
+    }
+    line
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_column(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    styles: &Styles,
+    status: Status,
+    idx: usize,
+    now: i64,
+    query: Option<&str>,
+) {
     let col = &app.columns[idx];
     let (label, status_style) = status_label_and_style(status, styles);
-    let title = format!(" {} ({}) ", label, col.tasks.len());
     let focused = idx == app.focused;
 
+    let visible: Vec<(usize, &Task)> = col
+        .tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| query.map(|q| task_matches_query(t, q)).unwrap_or(true))
+        .collect();
+
+    let title = format!(" {} ({}) ", label, visible.len());
     let block = Block::bordered().title(Line::from(title)).border_style(status_style);
     let inner_width = area.width.saturating_sub(2) as usize;
 
-    let items: Vec<ListItem> = if col.tasks.is_empty() {
+    let items: Vec<ListItem> = if visible.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             "—",
             styles.default.add_modifier(Modifier::DIM),
         )))]
     } else {
-        col.tasks
+        visible
             .iter()
-            .enumerate()
             .map(|(i, task)| {
-                let marker = priority_marker(task.priority);
-                let budget = inner_width.saturating_sub(marker.chars().count());
-                let title = truncate_with_ellipsis(&task.title, budget);
-                let text = format!("{marker}{title}");
+                let urgency = dates::urgency(task.deadline, now);
+                let base_style = styles.for_urgency(urgency);
+                let text = card_line_text(task, inner_width, now);
 
-                let base_style = priority_style(task.priority, styles);
-                let style = if i == col.selected {
+                let style = if *i == col.selected {
                     if focused {
                         styles.selection
                     } else {
@@ -110,19 +149,25 @@ fn render_column(frame: &mut Frame, area: Rect, app: &App, styles: &Styles, stat
     frame.render_widget(list, area);
 }
 
-fn render_notes(frame: &mut Frame, area: Rect, app: &App, styles: &Styles) {
+fn render_notes(frame: &mut Frame, area: Rect, app: &App, styles: &Styles, query: Option<&str>) {
     let block = Block::bordered()
         .title(Line::from(" Notes "))
         .border_style(styles.border);
     let inner_width = area.width.saturating_sub(2) as usize;
 
-    let items: Vec<ListItem> = if app.notes.is_empty() {
+    let visible: Vec<_> = app
+        .notes
+        .iter()
+        .filter(|n| query.map(|q| note_matches_query(n, q)).unwrap_or(true))
+        .collect();
+
+    let items: Vec<ListItem> = if visible.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             "—",
             styles.default.add_modifier(Modifier::DIM),
         )))]
     } else {
-        app.notes
+        visible
             .iter()
             .map(|note| {
                 let first_line = note.body.lines().next().unwrap_or("");
@@ -189,6 +234,8 @@ mod tests {
                             body: String::new(),
                             status,
                             priority: Priority::Normal,
+                            start_date: None,
+                            deadline: None,
                         })
                         .unwrap();
                 }
@@ -308,7 +355,8 @@ mod tests {
         for c in "write the plan".chars() {
             press_char(&mut app, c);
         }
-        app.handle_key(KeyEvent::new(K::Tab, KeyModifiers::NONE)); // Title -> Priority
+        app.handle_key(KeyEvent::new(K::Tab, KeyModifiers::NONE)); // Title -> Status
+        app.handle_key(KeyEvent::new(K::Tab, KeyModifiers::NONE)); // Status -> Priority
         app.handle_key(KeyEvent::new(K::Enter, KeyModifiers::NONE)); // open Priority dropdown
         let backend = Phase5TestBackend::new(80, 24);
         let mut terminal = Phase5Terminal::new(backend).unwrap();
@@ -351,5 +399,166 @@ mod tests {
         terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
         let rendered = phase5_buffer_to_string(terminal.backend().buffer());
         assert!(rendered.contains('\u{1F512}'), "rendered:\n{rendered}");
+    }
+
+    // --- card colour by deadline / deadline badge / tags on the card ------
+
+    #[test]
+    fn card_line_text_shows_right_aligned_deadline_badge() {
+        let now = 0i64;
+        let task = Task {
+            id: 1,
+            board_id: None,
+            title: "buy milk".to_string(),
+            body: String::new(),
+            status: Status::ToDo,
+            priority: Priority::Normal,
+            position: 0,
+            created_at: 0,
+            updated_at: 0,
+            start_date: None,
+            deadline: Some(3 * 86_400),
+            tags: Vec::new(),
+        };
+        let line = card_line_text(&task, 30, now);
+        assert!(line.starts_with("buy milk"), "{line:?}");
+        assert!(line.ends_with("3d"), "{line:?}");
+        assert!(line.chars().count() <= 30);
+    }
+
+    #[test]
+    fn card_line_text_overdue_badge_is_negative() {
+        let now = 0i64;
+        let task = Task {
+            id: 1,
+            board_id: None,
+            title: "late".to_string(),
+            body: String::new(),
+            status: Status::ToDo,
+            priority: Priority::Normal,
+            position: 0,
+            created_at: 0,
+            updated_at: 0,
+            start_date: None,
+            deadline: Some(-2 * 86_400),
+            tags: Vec::new(),
+        };
+        let line = card_line_text(&task, 30, now);
+        assert!(line.ends_with("-2d"), "{line:?}");
+    }
+
+    #[test]
+    fn card_line_text_with_no_deadline_has_no_badge() {
+        let task = Task {
+            id: 1,
+            board_id: None,
+            title: "no due date".to_string(),
+            body: String::new(),
+            status: Status::ToDo,
+            priority: Priority::Normal,
+            position: 0,
+            created_at: 0,
+            updated_at: 0,
+            start_date: None,
+            deadline: None,
+            tags: Vec::new(),
+        };
+        let line = card_line_text(&task, 30, 0);
+        assert_eq!(line, "no due date");
+    }
+
+    #[test]
+    fn card_line_text_includes_tags() {
+        use crate::domain::task::Tag;
+        let task = Task {
+            id: 1,
+            board_id: None,
+            title: "call bank".to_string(),
+            body: String::new(),
+            status: Status::ToDo,
+            priority: Priority::Normal,
+            position: 0,
+            created_at: 0,
+            updated_at: 0,
+            start_date: None,
+            deadline: None,
+            tags: vec![Tag { id: 1, name: "home".to_string(), color: None }],
+        };
+        let line = card_line_text(&task, 40, 0);
+        assert!(line.contains("[home]"), "{line:?}");
+    }
+
+    /// The ASCII render acceptance check: a board with a card in every
+    /// urgency bucket, `--nocapture`d so the layout can be reviewed
+    /// without a real terminal.
+    #[test]
+    fn ascii_render_shows_every_urgency_state() {
+        let mut app = phase5_test_app(0, 0, 0);
+        let now = chrono::Local::now().timestamp();
+        let day = 86_400;
+        {
+            let store = app.db.store_for(app.board.id);
+            let mk = |title: &str, deadline: Option<i64>| NewTask {
+                title: title.to_string(),
+                body: String::new(),
+                status: Status::ToDo,
+                priority: Priority::Normal,
+                start_date: None,
+                deadline,
+            };
+            store.create_task(mk("no due date", None)).unwrap();
+            store.create_task(mk("distant task", Some(now + 20 * day))).unwrap();
+            store.create_task(mk("soon task", Some(now + 7 * day))).unwrap();
+            store.create_task(mk("near task", Some(now + 3 * day))).unwrap();
+            store.create_task(mk("imminent task", Some(now + day))).unwrap();
+            store.create_task(mk("overdue task", Some(now - 2 * day))).unwrap();
+        }
+        app.reload().unwrap();
+
+        let backend = Phase5TestBackend::new(100, 30);
+        let mut terminal = Phase5Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        let rendered = phase5_buffer_to_string(terminal.backend().buffer());
+        println!("--- board: every urgency state ---\n{rendered}");
+        assert!(rendered.contains("no due date"));
+        assert!(rendered.contains("distant task"));
+        assert!(rendered.contains("soon task"));
+        assert!(rendered.contains("near task"));
+        assert!(rendered.contains("imminent task"));
+        assert!(rendered.contains("overdue task"));
+    }
+
+    // --- search filtering ---------------------------------------------------
+
+    #[test]
+    fn search_hides_non_matching_cards_and_updates_column_count() {
+        let mut app = phase5_test_app(0, 0, 0);
+        {
+            let store = app.db.store_for(app.board.id);
+            for title in ["buy milk", "buy eggs", "call bank"] {
+                store
+                    .create_task(NewTask {
+                        title: title.to_string(),
+                        body: String::new(),
+                        status: Status::ToDo,
+                        priority: Priority::Normal,
+                        start_date: None,
+                        deadline: None,
+                    })
+                    .unwrap();
+            }
+        }
+        app.reload().unwrap();
+        press_char(&mut app, '/');
+        for c in "bank".chars() {
+            press_char(&mut app, c);
+        }
+        let backend = Phase5TestBackend::new(80, 24);
+        let mut terminal = Phase5Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        let rendered = phase5_buffer_to_string(terminal.backend().buffer());
+        assert!(rendered.contains("call bank"), "rendered:\n{rendered}");
+        assert!(!rendered.contains("buy milk"), "rendered:\n{rendered}");
+        assert!(rendered.contains("ToDo (1)"), "rendered:\n{rendered}");
     }
 }

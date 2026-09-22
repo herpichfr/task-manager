@@ -28,6 +28,11 @@ CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT,
 CREATE INDEX idx_notes_board ON notes(board_id, created_at);
 ";
 
+const MAIN_V2: &str = "
+ALTER TABLE tasks ADD COLUMN start_date INTEGER;
+ALTER TABLE tasks ADD COLUMN deadline INTEGER;
+";
+
 const BOARD_V1: &str = "
 CREATE TABLE board_meta (id INTEGER PRIMARY KEY CHECK (id = 1), name TEXT NOT NULL, created_at INTEGER NOT NULL);
 CREATE TABLE tasks (
@@ -47,8 +52,13 @@ CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL,
 CREATE INDEX idx_notes_created ON notes(created_at);
 ";
 
-pub const MIGRATIONS_MAIN: &[(i64, &str)] = &[(1, MAIN_V1)];
-pub const MIGRATIONS_BOARD: &[(i64, &str)] = &[(1, BOARD_V1)];
+const BOARD_V2: &str = "
+ALTER TABLE tasks ADD COLUMN start_date INTEGER;
+ALTER TABLE tasks ADD COLUMN deadline INTEGER;
+";
+
+pub const MIGRATIONS_MAIN: &[(i64, &str)] = &[(1, MAIN_V1), (2, MAIN_V2)];
+pub const MIGRATIONS_BOARD: &[(i64, &str)] = &[(1, BOARD_V1), (2, BOARD_V2)];
 
 const CREATE_VERSION_TABLE: &str = "CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER PRIMARY KEY,
@@ -90,4 +100,92 @@ pub fn current_version(conn: &Connection) -> Result<i64, StorageError> {
         |row| row.get(0),
     )?;
     Ok(version)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A v1 database (main and board schemas both) with existing rows must
+    /// upgrade to v2 in place: the rows survive, and the two new columns
+    /// come back NULL for them.
+    #[test]
+    fn v1_to_v2_migration_preserves_existing_rows_main() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply(&conn, &MIGRATIONS_MAIN[0..1]).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 1);
+
+        conn.execute(
+            "INSERT INTO boards (name, kind, position, created_at, updated_at)
+             VALUES ('alpha', 'plain', 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        let board_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO tasks (board_id, title, body, status, priority, position, created_at, updated_at)
+             VALUES (?1, 'pre-existing task', 'body text', 'todo', 'normal', 0, 0, 0)",
+            rusqlite::params![board_id],
+        )
+        .unwrap();
+        let task_id = conn.last_insert_rowid();
+
+        apply(&conn, MIGRATIONS_MAIN).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 2);
+
+        let (title, start_date, deadline): (String, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT title, start_date, deadline FROM tasks WHERE id = ?1",
+                rusqlite::params![task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "pre-existing task");
+        assert_eq!(start_date, None);
+        assert_eq!(deadline, None);
+
+        let board_name: String = conn
+            .query_row("SELECT name FROM boards WHERE id = ?1", rusqlite::params![board_id], |row| row.get(0))
+            .unwrap();
+        assert_eq!(board_name, "alpha");
+    }
+
+    #[test]
+    fn v1_to_v2_migration_preserves_existing_rows_board() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply(&conn, &MIGRATIONS_BOARD[0..1]).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 1);
+
+        conn.execute(
+            "INSERT INTO tasks (title, body, status, priority, position, created_at, updated_at)
+             VALUES ('pre-existing task', 'body text', 'todo', 'normal', 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        let task_id = conn.last_insert_rowid();
+
+        apply(&conn, MIGRATIONS_BOARD).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 2);
+
+        let (title, start_date, deadline): (String, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT title, start_date, deadline FROM tasks WHERE id = ?1",
+                rusqlite::params![task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "pre-existing task");
+        assert_eq!(start_date, None);
+        assert_eq!(deadline, None);
+    }
+
+    #[test]
+    fn migrations_are_idempotent_and_versioned() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 0);
+        apply(&conn, MIGRATIONS_MAIN).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 2);
+        apply(&conn, MIGRATIONS_MAIN).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 2);
+    }
 }

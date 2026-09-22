@@ -29,6 +29,8 @@ pub enum Ctx {
     Dropdown,
     Confirm,
     Passphrase,
+    TextPrompt,
+    TagPicker,
 }
 
 pub const BINDINGS: &[Binding] = &[
@@ -45,11 +47,16 @@ pub const BINDINGS: &[Binding] = &[
     Binding { keys: "H/L", label: "move col", rank: 1, ctx: Ctx::Board },
     Binding { keys: "J/K", label: "reorder", rank: 2, ctx: Ctx::Board },
     Binding { keys: "m", label: "column", rank: 2, ctx: Ctx::Board },
+    Binding { keys: "S", label: "status", rank: 2, ctx: Ctx::Board },
     Binding { keys: "p", label: "priority", rank: 2, ctx: Ctx::Board },
-    Binding { keys: "t", label: "tag", rank: 2, ctx: Ctx::Board },
+    Binding { keys: "t", label: "tags", rank: 2, ctx: Ctx::Board },
     Binding { keys: "dd", label: "delete", rank: 1, ctx: Ctx::Board },
     Binding { keys: "c", label: "note", rank: 1, ctx: Ctx::Board },
     // --- Notes pane ----------------------------------------------------
+    Binding { keys: "a/i", label: "new note", rank: 1, ctx: Ctx::Notes },
+    Binding { keys: "e", label: "edit", rank: 1, ctx: Ctx::Notes },
+    Binding { keys: "dd", label: "delete", rank: 1, ctx: Ctx::Notes },
+    Binding { keys: "c", label: "quick capture", rank: 1, ctx: Ctx::Notes },
     Binding { keys: "gp", label: "promote", rank: 1, ctx: Ctx::Notes },
     // --- Global ----------------------------------------------------------
     Binding { keys: "Tab", label: "pane", rank: 1, ctx: Ctx::Global },
@@ -80,6 +87,17 @@ pub const BINDINGS: &[Binding] = &[
     // --- Passphrase popup ----------------------------------------------
     Binding { keys: "Enter", label: "unlock", rank: 0, ctx: Ctx::Passphrase },
     Binding { keys: "Esc", label: "cancel", rank: 1, ctx: Ctx::Passphrase },
+
+    // --- One-line text prompt (new/rename tag, board name) --------------
+    Binding { keys: "Enter", label: "save", rank: 0, ctx: Ctx::TextPrompt },
+    Binding { keys: "Esc", label: "cancel", rank: 1, ctx: Ctx::TextPrompt },
+
+    // --- Tag picker -----------------------------------------------------
+    Binding { keys: "Enter", label: "toggle tag", rank: 0, ctx: Ctx::TagPicker },
+    Binding { keys: "j/k", label: "move", rank: 1, ctx: Ctx::TagPicker },
+    Binding { keys: "r", label: "rename", rank: 2, ctx: Ctx::TagPicker },
+    Binding { keys: "d", label: "delete", rank: 3, ctx: Ctx::TagPicker },
+    Binding { keys: "Esc", label: "close", rank: 4, ctx: Ctx::TagPicker },
 ];
 
 /// Hints for the footer restricted to exactly the given context, sorted by
@@ -184,6 +202,7 @@ pub fn resolve(
         (false, KeyCode::Char('J')) => Action::ReorderTaskDown,
         (false, KeyCode::Char('K')) => Action::ReorderTaskUp,
         (false, KeyCode::Char('m')) => Action::OpenColumnDropdown,
+        (false, KeyCode::Char('S')) => Action::OpenColumnDropdown,
         (false, KeyCode::Char('p')) => Action::OpenPriorityDropdown,
         (false, KeyCode::Char('t')) => Action::OpenTagDropdown,
         (false, KeyCode::Char('c')) => Action::CaptureNote,
@@ -355,5 +374,33 @@ mod tests {
         assert!(!hints_for(Ctx::Dropdown).is_empty());
         assert!(!hints_for(Ctx::Confirm).is_empty());
         assert!(!hints_for(Ctx::Passphrase).is_empty());
+        assert!(!hints_for(Ctx::TextPrompt).is_empty());
+        assert!(!hints_for(Ctx::TagPicker).is_empty());
+        // A text prompt must not advertise the passphrase popup's "unlock".
+        assert!(hints_for(Ctx::TextPrompt).iter().all(|b| b.label != "unlock"));
+        // The tag picker must advertise rename and delete, which a plain
+        // dropdown has no equivalent of.
+        assert!(hints_for(Ctx::TagPicker).iter().any(|b| b.label == "rename"));
+        assert!(hints_for(Ctx::TagPicker).iter().any(|b| b.label == "delete"));
+    }
+
+    #[test]
+    fn shift_s_opens_the_same_status_change_as_m() {
+        let mut p = PendingSeq::default();
+        assert_eq!(
+            resolve_n(Mode::Normal, false, KeyCode::Char('S'), &mut p),
+            Action::OpenColumnDropdown
+        );
+    }
+
+    #[test]
+    fn notes_hint_bar_lists_add_edit_delete_capture_promote() {
+        let hints = hints_for(Ctx::Notes);
+        let labels: Vec<&str> = hints.iter().map(|b| b.label).collect();
+        assert!(labels.contains(&"new note"), "{labels:?}");
+        assert!(labels.contains(&"edit"), "{labels:?}");
+        assert!(labels.contains(&"delete"), "{labels:?}");
+        assert!(labels.contains(&"quick capture"), "{labels:?}");
+        assert!(labels.contains(&"promote"), "{labels:?}");
     }
 }

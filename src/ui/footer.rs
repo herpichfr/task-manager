@@ -110,7 +110,16 @@ fn mode_label(app: &App) -> String {
         Mode::Command => format!(":{}", app.cmdline),
         Mode::Search => format!("/{}", app.search),
         Mode::Insert => "INSERT".to_string(),
-        Mode::Normal => "NORMAL".to_string(),
+        Mode::Normal => {
+            // A committed search filter (`search_active`) stays visible in
+            // Normal mode so there is always some indicator that the board
+            // is filtered, alongside `Esc`/`:nohl` to clear it.
+            if app.search_active && !app.search.is_empty() {
+                format!("NORMAL /{}", app.search)
+            } else {
+                "NORMAL".to_string()
+            }
+        }
     }
 }
 
@@ -235,5 +244,23 @@ mod tests {
     fn empty_hints_never_panics() {
         let hints: Vec<&Binding> = Vec::new();
         assert_eq!(fit_hints(&hints, 50), "");
+    }
+
+    #[test]
+    fn mode_label_shows_committed_search_filter_in_normal_mode() {
+        use crate::config::Config;
+        use crate::domain::board::BoardKind;
+        use crate::storage::main_db::MainDb;
+
+        let db = MainDb::open_in_memory().unwrap();
+        db.create_board("test", BoardKind::Plain).unwrap();
+        let board = db.get_board_by_name("test").unwrap().unwrap();
+        let mut app = App::new(Config::default(), db, board).unwrap();
+
+        assert_eq!(mode_label(&app), "NORMAL");
+
+        app.search = "milk".to_string();
+        app.search_active = true;
+        assert_eq!(mode_label(&app), "NORMAL /milk");
     }
 }
