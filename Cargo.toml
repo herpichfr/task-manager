@@ -1,0 +1,29 @@
+[package]
+name = "tsk"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Vim-native terminal kanban task manager and quick note taker with encrypted boards"
+license = "MIT"
+
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
+rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+clap = { version = "4", features = ["derive"] }
+directories = "6"
+argon2 = "0.6"
+rand = "0.9"
+zeroize = { version = "1", features = ["derive"] }
+thiserror = "2"
+chrono = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
