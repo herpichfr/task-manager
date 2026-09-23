@@ -109,7 +109,7 @@ pub fn resolve(theme: &Theme, depth: ColorDepth) -> Styles {
 /// | `Soon` (5-14 days)       | yellow                                 |
 /// | `Near` (2-4 days)        | orange (256-index 208); yellow at 16   |
 /// | `Imminent` (0-1 days)    | red                                     |
-/// | `Overdue` (< 0 days)     | black background, white foreground     |
+/// | `Overdue` (< 0 days)     | purple background (256-index 91), white foreground |
 pub fn urgency_style(theme: &Theme, urgency: Urgency, depth: ColorDepth) -> Style {
     match urgency {
         Urgency::None => parse_style(&theme.deadline_none, depth),
@@ -117,14 +117,14 @@ pub fn urgency_style(theme: &Theme, urgency: Urgency, depth: ColorDepth) -> Styl
         Urgency::Soon => parse_style(&theme.deadline_soon, depth),
         Urgency::Near => parse_style(&theme.deadline_near, depth),
         Urgency::Imminent => parse_style(&theme.deadline_imminent, depth),
-        // The only bucket with a background: overdue is white on black.
+        // The only bucket with a background: overdue is white on purple.
         Urgency::Overdue => {
             let fg = parse_style(&theme.deadline_overdue_fg, depth)
                 .fg
                 .unwrap_or(Color::White);
             let bg = parse_style(&theme.deadline_overdue_bg, depth)
                 .fg
-                .unwrap_or(Color::Black);
+                .unwrap_or(Color::Magenta);
             Style::default().fg(fg).bg(bg)
         }
     }
@@ -419,11 +419,21 @@ mod tests {
     }
 
     #[test]
-    fn urgency_overdue_is_black_background_white_foreground_at_every_depth() {
+    fn urgency_overdue_is_purple_background_white_foreground_at_every_depth() {
         for depth in DEPTHS {
             let style = urgency_style(&Theme::default(), Urgency::Overdue, depth);
             assert_eq!(style.fg, Some(Color::White), "depth {depth:?}");
-            assert_eq!(style.bg, Some(Color::Black), "depth {depth:?}");
+            match depth {
+                ColorDepth::TrueColor => {
+                    assert_eq!(style.bg, Some(Color::Rgb(0x87, 0x00, 0xaf)), "depth {depth:?}");
+                }
+                ColorDepth::Ansi256 => {
+                    assert_eq!(style.bg, Some(Color::Indexed(91)), "depth {depth:?}");
+                }
+                ColorDepth::Ansi16 => {
+                    assert_eq!(style.bg, Some(Color::Magenta), "depth {depth:?}");
+                }
+            }
         }
     }
 

@@ -77,8 +77,9 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut A
                     // `Terminal`. `App` only records the request, so it
                     // stays unit-testable with no terminal at all.
                     if let Some((target, initial)) = app.take_pending_edit() {
+                        let title = app.pending_edit_title(target);
                         match app.editor_command() {
-                            Ok(bin) => match crate::editor::edit_text(terminal, &bin, &initial) {
+                            Ok(bin) => match crate::editor::edit_text(terminal, &bin, &initial, title.as_deref()) {
                                 Ok(text) => app.apply_edited_text(target, text),
                                 Err(e) => app.report_editor_error(e),
                             },
@@ -90,6 +91,13 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut A
                 _ => {}
             }
         }
+
+        // Rate-limited to about once a second inside `App`; called every
+        // tick (idle or not) so a database replaced on disk -- e.g. by
+        // Dropbox syncing the other machine's write -- is picked up even
+        // while a popup or form is open, and any later write goes to the
+        // new file instead of an orphaned one.
+        app.check_external_change();
 
         if app.should_quit {
             break;

@@ -6,6 +6,13 @@
 # Dropbox or Nextcloud -- concurrent sync corrupts SQLite WAL files.
 db_dir = "~/.local/share/tsk"
 
+# SQLite's on-disk journal. "wal" (default) is fast but splits each
+# database into three files (.db, -wal, -shm) that a sync tool like
+# Dropbox or Syncthing can replace independently, out of step with each
+# other. Set this to "delete" when db_dir lives in a synced folder --
+# each database is then one self-contained file between writes.
+journal_mode = "wal"
+
 # Board to open at startup. Unset opens the first board.
 # default_board = "personal"
 
@@ -37,7 +44,7 @@ deadline_soon     = "yellow"     # 14 to 5 days
 deadline_near     = "#ff8700"    # 4 to 2 days (orange; no ANSI name exists)
 deadline_imminent = "red"        # less than 2 days
 deadline_overdue_fg = "white"    # overdue: white text...
-deadline_overdue_bg = "black"    # ...on a black background
+deadline_overdue_bg = "#8700af"  # ...on a purple background
 
 # --- Column headers ---------------------------------------------------
 todo  = "yellow"

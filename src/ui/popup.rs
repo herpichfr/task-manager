@@ -738,12 +738,22 @@ fn render_archive_browser(frame: &mut Frame, area: Rect, t: &ArchiveBrowserState
 
 fn render_help(frame: &mut Frame, area: Rect, styles: &Styles) {
     // Board, notes-pane and global bindings: a popup's own keys are already in the footer
-    // while it is open. Entries flow into extra columns when the terminal is
-    // too short to list them in one.
+    // while it is open. `Ctx::BoardArrows` is included here too -- the arrow-key
+    // equivalents of Board's h/l/j/k, kept out of the footer (which only ever
+    // asks for `Ctx::Board`) so they do not lengthen its hint line. Entries flow
+    // into extra columns when the terminal is too short to list them in one.
     const COL_WIDTH: u16 = 23;
     let entries: Vec<String> = crate::keymap::BINDINGS
         .iter()
-        .filter(|b| matches!(b.ctx, crate::keymap::Ctx::Board | crate::keymap::Ctx::Notes | crate::keymap::Ctx::Global))
+        .filter(|b| {
+            matches!(
+                b.ctx,
+                crate::keymap::Ctx::Board
+                    | crate::keymap::Ctx::BoardArrows
+                    | crate::keymap::Ctx::Notes
+                    | crate::keymap::Ctx::Global
+            )
+        })
         .map(|b| format!("{:<8} {:<13} ", b.keys, b.label))
         .collect();
     let max_rows = (area.height.saturating_sub(4) as usize).max(1);
@@ -825,6 +835,15 @@ mod tests {
         assert_eq!(d.selected, 2); // wrapped up from 0
         handle_dropdown_key(&mut d, key(KeyCode::Char('j')));
         assert_eq!(d.selected, 0); // wrapped down from 2
+    }
+
+    #[test]
+    fn dropdown_up_down_arrows_navigate_the_same_as_j_k() {
+        let mut d = sample_dropdown();
+        assert!(matches!(handle_dropdown_key(&mut d, key(KeyCode::Up)), PopupOutcome::Consumed));
+        assert_eq!(d.selected, 2); // wrapped up from 0, same as 'k'
+        handle_dropdown_key(&mut d, key(KeyCode::Down));
+        assert_eq!(d.selected, 0); // wrapped down from 2, same as 'j'
     }
 
     #[test]
@@ -1161,10 +1180,27 @@ mod tests {
     #[test]
     fn help_lists_board_notes_and_global_bindings() {
         let text = help_text(140, 45);
-        for b in crate::keymap::BINDINGS.iter().filter(|b| matches!(b.ctx, crate::keymap::Ctx::Board | crate::keymap::Ctx::Notes | crate::keymap::Ctx::Global)) {
+        for b in crate::keymap::BINDINGS.iter().filter(|b| {
+            matches!(
+                b.ctx,
+                crate::keymap::Ctx::Board
+                    | crate::keymap::Ctx::BoardArrows
+                    | crate::keymap::Ctx::Notes
+                    | crate::keymap::Ctx::Global
+            )
+        }) {
             assert!(text.contains(b.label), "help is missing {:?}", b.keys);
         }
         assert!(text.contains("archive"));
+    }
+
+    #[test]
+    fn help_lists_the_arrow_key_equivalents_of_h_l_j_k() {
+        let text = help_text(140, 45);
+        assert!(text.contains('\u{2190}'), "help is missing the left-arrow hint:\n{text}");
+        assert!(text.contains('\u{2192}'), "help is missing the right-arrow hint:\n{text}");
+        assert!(text.contains('\u{2191}'), "help is missing the up-arrow hint:\n{text}");
+        assert!(text.contains('\u{2193}'), "help is missing the down-arrow hint:\n{text}");
     }
 
     #[test]
@@ -1261,6 +1297,18 @@ mod tests {
         assert_eq!(a.selected, 0);
         handle_archive_key(&mut a, key(KeyCode::Char('k')));
         assert_eq!(a.selected, 2, "k from the top wraps to the last row");
+    }
+
+    #[test]
+    fn archive_arrows_navigate_the_same_as_j_k_and_do_not_reach_the_filter() {
+        let mut a = sample_archive();
+        handle_archive_key(&mut a, key(KeyCode::Down));
+        assert_eq!(a.selected, 1);
+        assert_eq!(a.filter, "", "Down must navigate, not type");
+        handle_archive_key(&mut a, key(KeyCode::Up));
+        assert_eq!(a.selected, 0);
+        handle_archive_key(&mut a, key(KeyCode::Up));
+        assert_eq!(a.selected, 2, "Up from the top wraps to the last row");
     }
 
     #[test]

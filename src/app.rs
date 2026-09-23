@@ -139,6 +139,18 @@ pub struct App {
     /// switcher is (re)opened, so it never survives past the dropdown it
     /// was set on.
     board_switcher_pending_d: bool,
+    /// Snapshot of `main.db`'s on-disk identity, refreshed at the end of
+    /// every `reload()`. `None` for an in-memory connection (every test
+    /// that does not open a real file) or before the first reload.
+    fp_main: Option<FileFingerprint>,
+    /// Same, for the active locked board's own file -- only ever `Some`
+    /// while `self.board` is a locked board that is currently unlocked.
+    fp_locked: Option<FileFingerprint>,
+    /// Set by every `check_external_change` call; rate-limits the event
+    /// loop's ~250ms tick to about once a second. `None` forces the next
+    /// call to actually check, which is also how `Action::Refresh` reaches
+    /// `reconcile_external_change` directly, bypassing the limit.
+    last_external_check: Option<std::time::Instant>,
 }
 
 /// What an external-editor session is editing.
@@ -152,6 +164,49 @@ pub enum EditTarget {
 
 /// How many rows a half-page scroll moves, absent a known viewport height.
 const HALF_PAGE: u32 = 5;
+
+/// Minimum spacing between the on-disk-change checks the event loop's
+/// ~250ms tick drives (`App::check_external_change`), so an idle session
+/// doesn't `stat` up to two files four times a second for nothing. An
+/// explicit `:e`/`:reload`/`Action::Refresh` bypasses this by calling
+/// `reconcile_external_change` directly.
+const EXTERNAL_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A cheap, comparable snapshot of a database file's identity and content
+/// on disk: device + inode (so a replace-by-rename -- e.g. Dropbox
+/// swapping in the other machine's synced copy -- is detected even if
+/// length and mtime happen to match) plus length and mtime (so an
+/// in-place rewrite that keeps the same inode is still caught).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileFingerprint {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: i64,
+}
+
+/// `None` when the path cannot be `stat`-ed -- missing, or mid-replace by a
+/// sync tool -- which callers treat as "no known change" rather than an
+/// error, so a transient gap never mistakenly looks like a match *or* a
+/// mismatch.
+fn file_fingerprint(path: &std::path::Path) -> Option<FileFingerprint> {
+    let meta = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(FileFingerprint { dev: meta.dev(), ino: meta.ino(), len: meta.len(), mtime: meta.mtime() })
+    }
+    #[cfg(not(unix))]
+    {
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        Some(FileFingerprint { dev: 0, ino: 0, len: meta.len(), mtime })
+    }
+}
 
 /// Days after which a Done task is auto-archived: hidden from the board
 /// (and so from the board's `/` search, which only ever sees
@@ -557,6 +612,9 @@ impl App {
             unlocked: HashMap::new(),
             data_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             board_switcher_pending_d: false,
+            fp_main: None,
+            fp_locked: None,
+            last_external_check: None,
         };
         app.reload()?;
         Ok(app)
@@ -636,7 +694,101 @@ impl App {
             self.notes_selected.min(self.notes.len() - 1)
         };
         self.clamp_selection_to_visible();
+        self.record_fingerprints();
         Ok(())
+    }
+
+    /// Captures the current on-disk fingerprint of the active database
+    /// file(s), so a later mismatch means something else touched them.
+    /// Called at the end of every `reload()` -- which every mutating
+    /// action already goes through -- so the app's own writes are never
+    /// mistaken for an external change.
+    fn record_fingerprints(&mut self) {
+        self.fp_main = self.db.path().and_then(file_fingerprint);
+        self.fp_locked = if self.board.kind == BoardKind::Locked {
+            self.board.db_path.as_deref().and_then(|p| file_fingerprint(std::path::Path::new(p)))
+        } else {
+            None
+        };
+    }
+
+    /// Called from the event loop's ~250ms tick. Rate-limited to about
+    /// once a second via `last_external_check`; `Action::Refresh` (bound
+    /// to `:e`/`:reload`) bypasses the limit by calling
+    /// `reconcile_external_change` directly instead.
+    pub fn check_external_change(&mut self) {
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last_external_check {
+            if now.duration_since(last) < EXTERNAL_CHECK_INTERVAL {
+                return;
+            }
+        }
+        self.last_external_check = Some(now);
+        self.reconcile_external_change();
+    }
+
+    /// Compares the active database file(s) against the last-recorded
+    /// fingerprint and, on a mismatch, reopens and reloads. Returns
+    /// whether it did. A missing file (mid-replace, or briefly absent) is
+    /// treated as "no known change" rather than an error: the old
+    /// connection and state are kept, and the next check retries.
+    ///
+    /// `App` does not retain the passphrase-derived key after unlocking a
+    /// board -- only the open `LockedDb` connection in `self.unlocked` --
+    /// so a changed locked-board file cannot be reopened here; it is
+    /// locked cleanly instead, with a message asking the user to re-enter
+    /// the passphrase.
+    fn reconcile_external_change(&mut self) -> bool {
+        let main_fp = self.db.path().and_then(file_fingerprint);
+        let main_changed = main_fp.is_some() && main_fp != self.fp_main;
+
+        let locked_fp = if self.board.kind == BoardKind::Locked {
+            self.board.db_path.as_deref().and_then(|p| file_fingerprint(std::path::Path::new(p)))
+        } else {
+            None
+        };
+        let locked_changed = locked_fp.is_some() && locked_fp != self.fp_locked;
+
+        if !main_changed && !locked_changed {
+            return false;
+        }
+
+        if main_changed {
+            let Some(main_path) = self.db.path().map(std::path::Path::to_path_buf) else {
+                return false;
+            };
+            match MainDb::open(&main_path, self.config.journal_mode) {
+                Ok(db) => self.db = db,
+                Err(e) => {
+                    self.message = Some(format!(
+                        "database changed on disk but reopen failed, keeping the previous connection: {e}"
+                    ));
+                    return false;
+                }
+            }
+        }
+
+        let mut relocked_name = None;
+        if locked_changed {
+            self.unlocked.remove(&self.board.id);
+            relocked_name = Some(self.board.name.clone());
+            let boards = self.db.list_boards().unwrap_or_default();
+            if let Some(plain) = boards.into_iter().find(|b| b.kind == BoardKind::Plain) {
+                self.board = plain;
+                self.pane = Pane::Board;
+                self.focused = 0;
+            }
+        }
+
+        self.undo = UndoStack::default();
+        let _ = self.reload();
+        self.message = Some(match relocked_name {
+            Some(name) => format!(
+                "reloaded: database changed on disk; \"{name}\" was locked, re-enter the passphrase to unlock"
+            ),
+            None => "reloaded: database changed on disk".to_string(),
+        });
+        true
     }
 
     /// The footer context this app's current state should show hints for.
@@ -1412,6 +1564,22 @@ impl App {
         self.pending_edit.take()
     }
 
+    /// Best-effort title for the tmux floating editor's popup border:
+    /// `EditTarget::Task`'s current title from the store, or the open
+    /// form's `title` field for `EditTarget::FormBody`. `None` when
+    /// neither is available -- the task may have been deleted between the
+    /// key press and this call, or the form's title is still blank --
+    /// in which case the caller falls back to "body".
+    pub fn pending_edit_title(&self, target: EditTarget) -> Option<String> {
+        match target {
+            EditTarget::Task(id) => self.store().get_task(id).ok().map(|t| t.title),
+            EditTarget::FormBody => match self.popups.last() {
+                Some(Popup::Form(f)) if !f.title.trim().is_empty() => Some(f.title.clone()),
+                _ => None,
+            },
+        }
+    }
+
     /// Reports that an external editor could not be started or run.
     pub fn report_editor_error(&mut self, e: impl std::fmt::Display) {
         self.message = Some(format!("editor failed: {e}"));
@@ -1651,6 +1819,10 @@ impl App {
             self.message = Some("search cleared".to_string());
             return;
         }
+        if cmd == "e" || cmd == "reload" {
+            self.dispatch(Action::Refresh);
+            return;
+        }
         if cmd == "board" {
             self.open_board_menu();
             return;
@@ -1836,7 +2008,7 @@ impl App {
 
         let path = self.data_dir.join(format!("board-{board_id}.db"));
 
-        if let Err(e) = LockedDb::create(&path, &key_hex, name) {
+        if let Err(e) = LockedDb::create(&path, &key_hex, name, self.config.journal_mode) {
             let _ = self.db.delete_board(board_id);
             self.message = Some(format!("failed to create encrypted file: {e}"));
             return;
@@ -2070,7 +2242,7 @@ impl App {
         };
         let key_hex = crate::crypto::key_to_hex(&key);
 
-        match LockedDb::open(std::path::Path::new(&db_path), &key_hex) {
+        match LockedDb::open(std::path::Path::new(&db_path), &key_hex, self.config.journal_mode) {
             Ok(locked) => {
                 self.unlocked.insert(board.id, locked);
                 self.board = board;
@@ -2187,10 +2359,13 @@ impl App {
                 self.pane = Pane::Board;
             }
             Action::Refresh => {
-                self.message = match self.reload() {
-                    Ok(()) => None,
-                    Err(e) => Some(format!("refresh failed: {e}")),
-                };
+                self.last_external_check = Some(std::time::Instant::now());
+                if !self.reconcile_external_change() {
+                    self.message = match self.reload() {
+                        Ok(()) => None,
+                        Err(e) => Some(format!("refresh failed: {e}")),
+                    };
+                }
             }
             Action::MoveUp(n) => {
                 self.move_selection(-(i64::from(n)));
@@ -2523,6 +2698,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::JournalMode;
     use crate::domain::task::{NewTask as DomainNewTask, Priority as DomainPriority};
 
     fn test_app_with_tasks() -> App {
@@ -2545,6 +2721,136 @@ mod tests {
         }
         let board = db.get_board_by_name("test").unwrap().unwrap();
         App::new(Config::default(), db, board).unwrap()
+    }
+
+    /// Same shape as `test_app_with_tasks`, but backed by a real on-disk
+    /// `main.db` under `dir` (`journal_mode = Delete`, so every write lands
+    /// in the single file and its fingerprint reliably changes -- see
+    /// `App::record_fingerprints`), for the external-change-detection tests
+    /// below. Seeds one task titled "original".
+    fn test_app_on_disk(dir: &tempfile::TempDir) -> App {
+        let path = dir.path().join("main.db");
+        let db = MainDb::open(&path, JournalMode::Delete).unwrap();
+        let board_id = db.create_board("test", BoardKind::Plain).unwrap();
+        db.store_for(board_id)
+            .create_task(DomainNewTask {
+                title: "original".to_string(),
+                body: String::new(),
+                status: Status::ToDo,
+                priority: DomainPriority::Normal,
+                start_date: None,
+                deadline: None,
+            })
+            .unwrap();
+        let board = db.get_board_by_name("test").unwrap().unwrap();
+        let mut app = App::new(Config::default(), db, board).unwrap();
+        app.set_data_dir(dir.path().to_path_buf());
+        app
+    }
+
+    // --- external database change detection --------------------------------
+
+    #[test]
+    fn external_change_reloads_from_replaced_main_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app_on_disk(&dir);
+        assert_eq!(app.columns[0].tasks[0].title, "original");
+
+        let other_path = dir.path().join("other.db");
+        {
+            let other = MainDb::open(&other_path, JournalMode::Delete).unwrap();
+            let board_id = other.create_board("test", BoardKind::Plain).unwrap();
+            other
+                .store_for(board_id)
+                .create_task(DomainNewTask {
+                    title: "from the other machine".to_string(),
+                    body: String::new(),
+                    status: Status::ToDo,
+                    priority: DomainPriority::Normal,
+                    start_date: None,
+                    deadline: None,
+                })
+                .unwrap();
+        }
+        std::fs::rename(&other_path, dir.path().join("main.db")).unwrap();
+
+        let changed = app.reconcile_external_change();
+
+        assert!(changed);
+        assert_eq!(app.columns[0].tasks.len(), 1);
+        assert_eq!(app.columns[0].tasks[0].title, "from the other machine");
+        assert_eq!(app.undo.undo_len(), 0);
+        assert_eq!(app.undo.redo_len(), 0);
+        assert_eq!(app.message.as_deref(), Some("reloaded: database changed on disk"));
+    }
+
+    #[test]
+    fn write_after_external_reload_lands_in_the_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut app = test_app_on_disk(&dir);
+
+            let other_path = dir.path().join("other.db");
+            {
+                let other = MainDb::open(&other_path, JournalMode::Delete).unwrap();
+                other.create_board("test", BoardKind::Plain).unwrap();
+            }
+            std::fs::rename(&other_path, dir.path().join("main.db")).unwrap();
+            assert!(app.reconcile_external_change());
+
+            app.dispatch(Action::NewTask);
+            if let Some(Popup::Form(f)) = app.popups.last_mut() {
+                f.title = "written after reload".to_string();
+            }
+            let outcome = app
+                .popups
+                .last_mut()
+                .unwrap()
+                .handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+            app.apply_popup_outcome(outcome);
+            // `app` (and its `MainDb` connection) is dropped at the end of
+            // this block, before a second connection reopens the same file
+            // below -- two live connections to one DELETE-journal-mode
+            // file can otherwise race into `SQLITE_BUSY`.
+        }
+
+        let reread = MainDb::open(&dir.path().join("main.db"), JournalMode::Delete).unwrap();
+        let board = reread.get_board_by_name("test").unwrap().unwrap();
+        let tasks = reread.store_for(board.id).list_tasks(Status::ToDo).unwrap();
+        assert!(tasks.iter().any(|t| t.title == "written after reload"));
+    }
+
+    #[test]
+    fn own_writes_do_not_trigger_a_reload_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app_on_disk(&dir);
+
+        app.dispatch(Action::NewTask);
+        if let Some(Popup::Form(f)) = app.popups.last_mut() {
+            f.title = "own write".to_string();
+        }
+        let outcome = app
+            .popups
+            .last_mut()
+            .unwrap()
+            .handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        app.apply_popup_outcome(outcome);
+
+        assert!(!app.reconcile_external_change());
+        assert_ne!(app.message.as_deref(), Some("reloaded: database changed on disk"));
+    }
+
+    #[test]
+    fn missing_main_db_during_check_does_not_panic_and_keeps_old_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app_on_disk(&dir);
+        std::fs::remove_file(dir.path().join("main.db")).unwrap();
+
+        let changed = app.reconcile_external_change();
+
+        assert!(!changed);
+        assert_eq!(app.columns[0].tasks.len(), 1);
+        assert_eq!(app.columns[0].tasks[0].title, "original");
     }
 
     /// Drives `App` through its own `:board new <name> locked` command

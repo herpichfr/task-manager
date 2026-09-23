@@ -13,9 +13,10 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
@@ -25,7 +26,10 @@ use crate::error::Result;
 
 /// Restores raw mode and the alternate screen on drop, so an early return
 /// (or a panic) while the editor is running can never leave the terminal
-/// stuck in "cooked" / primary-screen mode.
+/// stuck in "cooked" / primary-screen mode. Only ever constructed after the
+/// terminal has actually been left (the outside-tmux path); the tmux-popup
+/// path never leaves the terminal in the first place, so it never builds
+/// one -- see `edit_text`.
 struct RestoreGuard;
 
 impl Drop for RestoreGuard {
@@ -80,56 +84,78 @@ fn has_owner_only_permissions(path: &Path) -> io::Result<bool> {
     Ok(mode & 0o777 == 0o600)
 }
 
+/// Whether the calling terminal must be suspended (raw mode disabled, the
+/// alternate screen left) before the editor runs. `tmux` is `Some` exactly
+/// when the caller passes `$TMUX`'s value (its content is irrelevant, only
+/// its presence). Outside tmux the editor takes over the whole screen, so
+/// the terminal must be suspended first; inside tmux the editor runs in a
+/// floating `display-popup` with its own pty, which draws over the existing
+/// session without the app underneath ever leaving the alternate screen, so
+/// no suspend is needed. Pure and total, so this decision is unit-tested
+/// without a real tmux session.
+pub fn needs_suspend(tmux: Option<&str>) -> bool {
+    tmux.is_none()
+}
+
 /// Decides which program and arguments launch `editor` on `path`. Inside
-/// tmux (`tmux` is `Some` -- the caller passes `$TMUX`'s value, whose
-/// content is irrelevant, only its presence), the editor runs in a
-/// floating `display-popup` window sized to 80% of the terminal instead of
-/// taking over the whole screen; outside tmux, it runs directly, exactly
-/// as before this feature. Pure and total, so it is unit-tested without a
-/// real tmux session -- the popup path itself cannot be exercised
-/// headlessly.
-///
-/// The TUI underneath is still suspended/restored the same way in both
-/// branches (see `edit_text`): `tmux display-popup` draws over the
-/// existing session without needing the app under it to leave the
-/// alternate screen, but this could not be verified empirically against a
-/// real popup in this headless environment, and doing so would risk the
-/// load-bearing data-loss fix this module exists to protect. Suspending
-/// unconditionally is the same behaviour the fallback path always had, so
-/// it is the safe default here too.
-pub fn editor_invocation(editor: &str, path: &Path, tmux: Option<&str>) -> (String, Vec<String>) {
+/// tmux (`tmux` is `Some`), the editor runs in a floating `display-popup`
+/// window sized to 80% of the terminal, titled with `title` (falling back
+/// to "body" when none is given), instead of taking over the whole screen;
+/// outside tmux, it runs directly, exactly as before this feature. Pure and
+/// total, so the popup path's argument list is unit-tested without a real
+/// tmux session -- the popup itself cannot be exercised headlessly.
+pub fn editor_invocation(editor: &str, path: &Path, tmux: Option<&str>, title: Option<&str>) -> (String, Vec<String>) {
     let path_str = path.to_string_lossy().to_string();
     match tmux {
-        Some(_) => (
-            "tmux".to_string(),
-            vec![
-                "display-popup".to_string(),
-                "-E".to_string(),
-                "-w".to_string(),
-                "80%".to_string(),
-                "-h".to_string(),
-                "80%".to_string(),
-                editor.to_string(),
-                path_str,
-            ],
-        ),
+        Some(_) => {
+            let popup_title = title.unwrap_or("body");
+            (
+                "tmux".to_string(),
+                vec![
+                    "display-popup".to_string(),
+                    "-E".to_string(),
+                    "-w".to_string(),
+                    "80%".to_string(),
+                    "-h".to_string(),
+                    "80%".to_string(),
+                    "-T".to_string(),
+                    format!(" {popup_title} "),
+                    editor.to_string(),
+                    path_str,
+                ],
+            )
+        }
         None => (editor.to_string(), vec![path_str]),
     }
 }
 
 /// Suspends the TUI, runs `editor` on a temp file seeded with `initial`,
-/// restores the TUI, and returns the edited contents.
+/// restores the TUI, and returns the edited contents. `title` labels the
+/// tmux popup's border when the editor runs inside one; it is ignored
+/// outside tmux.
 ///
-/// Sequence, exactly: disable raw mode, leave the alternate screen, disable
-/// bracketed paste; spawn the editor (directly, or -- inside tmux -- inside
-/// a floating `tmux display-popup`, see `editor_invocation`) and wait for
+/// Outside tmux (`needs_suspend` is true): disable raw mode, leave the
+/// alternate screen, disable bracketed paste; spawn the editor and wait for
 /// it; re-enable bracketed paste, re-enter the alternate screen, re-enable
-/// raw mode, clear the terminal. A non-zero exit (or a spawn failure)
-/// discards the edit: `initial` is returned unchanged, not an error.
+/// raw mode, clear the terminal -- exactly as before this feature.
+///
+/// Inside tmux (`needs_suspend` is false): the terminal is left untouched --
+/// no raw-mode toggle, no alternate-screen switch -- so the board stays
+/// drawn underneath the floating `tmux display-popup`. The `tmux` client's
+/// own stdio is set to `/dev/null` so it cannot write into this pane. After
+/// it exits, any crossterm input events that queued up while the popup had
+/// focus are drained (non-blocking) so none of them are later misread as a
+/// key press against the board; the terminal is not cleared, since nothing
+/// here ever altered what is already on screen and clearing it would flash
+/// a blank frame before the next draw.
+///
+/// A non-zero exit (or a spawn failure) discards the edit in both cases:
+/// `initial` is returned unchanged, not an error.
 pub fn edit_text(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     editor: &str,
     initial: &str,
+    title: Option<&str>,
 ) -> Result<String> {
     let dir = std::env::temp_dir();
     let unique = std::time::SystemTime::now()
@@ -147,13 +173,31 @@ pub fn edit_text(
     // From here on the file is removed however we leave this function.
     let _temp = TempFileGuard(path.clone());
 
-    disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen, DisableBracketedPaste)?;
-    let guard = RestoreGuard;
-
     let tmux = std::env::var("TMUX").ok();
-    let (program, args) = editor_invocation(editor, &path, tmux.as_deref());
-    let status = Command::new(&program).args(&args).status();
+    let suspend = needs_suspend(tmux.as_deref());
+
+    // `_guard`, once built, restores raw mode / the alternate screen on
+    // drop -- covering an early return or a panic, not just the ordinary
+    // path. It is only built when `suspend` is true: the tmux-popup path
+    // never leaves the terminal in the first place, so it has nothing to
+    // restore.
+    let _guard = if suspend {
+        disable_raw_mode()?;
+        execute!(io::stdout(), LeaveAlternateScreen, DisableBracketedPaste)?;
+        Some(RestoreGuard)
+    } else {
+        None
+    };
+
+    let (program, args) = editor_invocation(editor, &path, tmux.as_deref(), title);
+    let mut command = Command::new(&program);
+    command.args(&args);
+    if !suspend {
+        // The tmux popup is its own pty; the `tmux` client itself must not
+        // write into (or read from) our pane while it runs.
+        command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    }
+    let status = command.status();
 
     // Read the user's work FIRST. Nothing about restoring the terminal is
     // allowed to stand between the editor exiting and the text being safe
@@ -164,10 +208,25 @@ pub fn edit_text(
         _ => initial.to_string(),
     };
 
-    drop(guard);
-    // Cosmetic only: the next draw repaints the screen anyway. This must
-    // never discard `edited`.
-    let _ = terminal.clear();
+    drop(_guard);
+
+    if !suspend {
+        // Drain whatever crossterm input queued up while the popup had
+        // focus, so none of it lands on the board as a stray key press.
+        // Non-blocking: this must never hang waiting for input that never
+        // arrives.
+        while event::poll(Duration::ZERO).unwrap_or(false) {
+            if event::read().is_err() {
+                break;
+            }
+        }
+    } else {
+        // Cosmetic only: the next draw repaints the screen anyway. This
+        // must never discard `edited`. Skipped in the tmux-popup path,
+        // where the terminal was never altered and clearing it would only
+        // flash a blank frame before the next draw fills it back in.
+        let _ = terminal.clear();
+    }
 
     Ok(edited)
 }
@@ -239,31 +298,61 @@ mod tests {
         assert_eq!(contents, "");
     }
 
+    // --- needs_suspend: pure, so this is testable without a real tmux
+    // session or a real terminal ------------------------------------------
+
+    #[test]
+    fn needs_suspend_is_true_outside_tmux() {
+        assert!(needs_suspend(None));
+    }
+
+    #[test]
+    fn needs_suspend_is_false_inside_tmux() {
+        assert!(!needs_suspend(Some("/tmp/tmux-1000/default,1234,0")));
+    }
+
     // --- editor_invocation: pure, so the tmux-popup branch is testable
     // without a real tmux session ---------------------------------------
 
     #[test]
     fn editor_invocation_wraps_in_tmux_popup_when_tmux_is_set() {
-        let (program, args) = editor_invocation("nvim", Path::new("/tmp/x.md"), Some("/tmp/tmux-1000/default,1234,0"));
+        let (program, args) =
+            editor_invocation("nvim", Path::new("/tmp/x.md"), Some("/tmp/tmux-1000/default,1234,0"), None);
         assert_eq!(program, "tmux");
         assert_eq!(
             args,
-            vec!["display-popup", "-E", "-w", "80%", "-h", "80%", "nvim", "/tmp/x.md"]
+            vec!["display-popup", "-E", "-w", "80%", "-h", "80%", "-T", " body ", "nvim", "/tmp/x.md"]
         );
     }
 
     #[test]
     fn editor_invocation_runs_editor_directly_without_tmux() {
-        let (program, args) = editor_invocation("nvim", Path::new("/tmp/x.md"), None);
+        let (program, args) = editor_invocation("nvim", Path::new("/tmp/x.md"), None, None);
         assert_eq!(program, "nvim");
         assert_eq!(args, vec!["/tmp/x.md".to_string()]);
     }
 
     #[test]
     fn editor_invocation_ignores_tmux_env_content_only_presence_matters() {
-        let (a, _) = editor_invocation("vim", Path::new("/p"), Some(""));
-        let (b, _) = editor_invocation("vim", Path::new("/p"), Some("anything"));
+        let (a, _) = editor_invocation("vim", Path::new("/p"), Some(""), None);
+        let (b, _) = editor_invocation("vim", Path::new("/p"), Some("anything"), None);
         assert_eq!(a, "tmux");
         assert_eq!(b, "tmux");
+    }
+
+    #[test]
+    fn editor_invocation_uses_the_given_title_in_the_tmux_popup() {
+        let (_, args) =
+            editor_invocation("nvim", Path::new("/tmp/x.md"), Some("sess"), Some("Buy milk"));
+        assert_eq!(
+            args,
+            vec!["display-popup", "-E", "-w", "80%", "-h", "80%", "-T", " Buy milk ", "nvim", "/tmp/x.md"]
+        );
+    }
+
+    #[test]
+    fn editor_invocation_without_tmux_ignores_title() {
+        let (_, args) = editor_invocation("nvim", Path::new("/tmp/x.md"), None, Some("Buy milk"));
+        assert_eq!(args, vec!["/tmp/x.md".to_string()]);
     }
 }

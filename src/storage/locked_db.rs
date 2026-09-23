@@ -22,6 +22,7 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
+use crate::config::JournalMode;
 use crate::domain::note::{Note, NoteId};
 use crate::domain::task::{NewTask, Status, Tag, TagId, Task, TaskId, TaskPatch};
 use crate::storage::task_store_impl as shared;
@@ -36,7 +37,12 @@ impl LockedDb {
     /// Creates a new encrypted board file at `path`. Fails (via an I/O
     /// `AlreadyExists` error) if the path already exists, so an existing
     /// file can never be silently overwritten.
-    pub fn create(path: &Path, key_hex: &str, board_name: &str) -> Result<Self, StorageError> {
+    pub fn create(
+        path: &Path,
+        key_hex: &str,
+        board_name: &str,
+        journal_mode: JournalMode,
+    ) -> Result<Self, StorageError> {
         if path.exists() {
             return Err(StorageError::Io(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
@@ -52,7 +58,7 @@ impl LockedDb {
         let conn = Connection::open(path)?;
         // Before the first write, so the WAL/SHM sidecars inherit 0600.
         crate::storage::harden_file(path)?;
-        Self::key_and_open(&conn, key_hex)?;
+        Self::key_and_open(&conn, key_hex, journal_mode)?;
         migrations::apply(&conn, migrations::MIGRATIONS_BOARD)?;
         let now = chrono::Utc::now().timestamp();
         conn.execute(
@@ -65,17 +71,21 @@ impl LockedDb {
     /// Opens an existing encrypted board file. A wrong `key_hex` surfaces
     /// as `StorageError::WrongPassphrase`, never a panic or a bare SQLite
     /// error -- see the probe read in `key_and_open`.
-    pub fn open(path: &Path, key_hex: &str) -> Result<Self, StorageError> {
+    pub fn open(path: &Path, key_hex: &str, journal_mode: JournalMode) -> Result<Self, StorageError> {
         let conn = Connection::open(path)?;
         crate::storage::harden_file(path)?;
-        Self::key_and_open(&conn, key_hex)?;
+        Self::key_and_open(&conn, key_hex, journal_mode)?;
         migrations::apply(&conn, migrations::MIGRATIONS_BOARD)?;
         Ok(Self { conn })
     }
 
     /// Keys the connection and probes it. See the module doc comment for
-    /// why this exact pragma order matters.
-    fn key_and_open(conn: &Connection, key_hex: &str) -> Result<(), StorageError> {
+    /// why this exact pragma order matters. `journal_mode` picks `WAL`
+    /// (default) or `DELETE` -- see `Config::journal_mode` and
+    /// `MainDb::init_conn` for why `DELETE` matters under Dropbox/Syncthing;
+    /// setting it here converts an existing WAL board file and checkpoints
+    /// (then removes) any leftover `-wal`/`-shm` as part of the same pragma.
+    fn key_and_open(conn: &Connection, key_hex: &str, journal_mode: JournalMode) -> Result<(), StorageError> {
         conn.execute_batch(&format!("PRAGMA key = \"x'{key_hex}'\";"))?;
         conn.execute_batch("PRAGMA cipher_log_level = NONE;")?;
 
@@ -84,7 +94,10 @@ impl LockedDb {
         probe.map_err(|_| StorageError::WrongPassphrase)?;
 
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-        conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+        match journal_mode {
+            JournalMode::Wal => conn.execute_batch("PRAGMA journal_mode = WAL;")?,
+            JournalMode::Delete => conn.execute_batch("PRAGMA journal_mode = DELETE;")?,
+        }
         conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
         Ok(())
     }
@@ -179,7 +192,7 @@ mod tests {
         let key_hex = key_hex_for("hunter2", &salt);
 
         {
-            let db = LockedDb::create(&path, &key_hex, "vault").unwrap();
+            let db = LockedDb::create(&path, &key_hex, "vault", JournalMode::Wal).unwrap();
             let store = db.store();
             store
                 .create_task(NewTask {
@@ -193,7 +206,7 @@ mod tests {
                 .unwrap();
         }
 
-        let db = LockedDb::open(&path, &key_hex).unwrap();
+        let db = LockedDb::open(&path, &key_hex, JournalMode::Wal).unwrap();
         let store = db.store();
         let tasks = store.list_tasks(Status::ToDo).unwrap();
         assert_eq!(tasks.len(), 1);
@@ -208,7 +221,7 @@ mod tests {
         std::fs::write(&path, b"anything").unwrap();
         let salt = crypto::generate_salt();
         let key_hex = key_hex_for("hunter2", &salt);
-        let err = LockedDb::create(&path, &key_hex, "vault").unwrap_err();
+        let err = LockedDb::create(&path, &key_hex, "vault", JournalMode::Wal).unwrap_err();
         assert!(matches!(err, StorageError::Io(_)));
     }
 
@@ -218,11 +231,55 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("perm.db");
-        let _db = LockedDb::create(&path, &"ab".repeat(32), "perm").unwrap();
+        let _db = LockedDb::create(&path, &"ab".repeat(32), "perm", JournalMode::Wal).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "encrypted board file must not be world-readable");
         let dmode = std::fs::metadata(dir.path()).unwrap().permissions().mode();
         assert_eq!(dmode & 0o777, 0o700, "data directory must not be world-listable");
+    }
+
+    #[test]
+    fn locked_db_delete_mode_reports_delete_journal_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.db");
+        let salt = crypto::generate_salt();
+        let key_hex = key_hex_for("hunter2", &salt);
+        let db = LockedDb::create(&path, &key_hex, "vault", JournalMode::Delete).unwrap();
+        let mode: String = db.conn.query_row("PRAGMA journal_mode", [], |row| row.get(0)).unwrap();
+        assert_eq!(mode, "delete");
+    }
+
+    #[test]
+    fn reopening_wal_locked_board_with_delete_converts_and_keeps_rows_no_wal_file_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.db");
+        let salt = crypto::generate_salt();
+        let key_hex = key_hex_for("hunter2", &salt);
+        {
+            let db = LockedDb::create(&path, &key_hex, "vault", JournalMode::Wal).unwrap();
+            db.store()
+                .create_task(NewTask {
+                    title: "keep me".into(),
+                    body: String::new(),
+                    status: Status::ToDo,
+                    priority: Priority::Normal,
+                    start_date: None,
+                    deadline: None,
+                })
+                .unwrap();
+        }
+
+        {
+            let db = LockedDb::open(&path, &key_hex, JournalMode::Delete).unwrap();
+            let mode: String = db.conn.query_row("PRAGMA journal_mode", [], |row| row.get(0)).unwrap();
+            assert_eq!(mode, "delete");
+            let tasks = db.store().list_tasks(Status::ToDo).unwrap();
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0].title, "keep me");
+        }
+
+        let wal_path = dir.path().join("board.db-wal");
+        assert!(!wal_path.exists(), "no -wal file should remain after switching to DELETE mode and closing");
     }
 
     #[test]
@@ -233,8 +290,8 @@ mod tests {
         let right_key = key_hex_for("hunter2", &salt);
         let wrong_key = key_hex_for("wrong", &salt);
 
-        LockedDb::create(&path, &right_key, "vault").unwrap();
-        let err = LockedDb::open(&path, &wrong_key).unwrap_err();
+        LockedDb::create(&path, &right_key, "vault", JournalMode::Wal).unwrap();
+        let err = LockedDb::open(&path, &wrong_key, JournalMode::Wal).unwrap_err();
         assert!(matches!(err, StorageError::WrongPassphrase));
     }
 
@@ -246,7 +303,7 @@ mod tests {
         let key_hex = key_hex_for("hunter2", &salt);
 
         {
-            let db = LockedDb::create(&path, &key_hex, "vault").unwrap();
+            let db = LockedDb::create(&path, &key_hex, "vault", JournalMode::Wal).unwrap();
             db.store()
                 .create_task(NewTask {
                     title: "PLAINTEXT_CANARY".into(),
@@ -271,7 +328,7 @@ mod tests {
         let path = dir.path().join("board.db");
         let salt = crypto::generate_salt();
         let key_hex = key_hex_for("hunter2", &salt);
-        let db = LockedDb::create(&path, &key_hex, "vault").unwrap();
+        let db = LockedDb::create(&path, &key_hex, "vault", JournalMode::Wal).unwrap();
         let store = db.store();
 
         let a = store
@@ -312,7 +369,7 @@ mod tests {
         let path = dir.path().join("board.db");
         let salt = crypto::generate_salt();
         let key_hex = key_hex_for("hunter2", &salt);
-        let db = LockedDb::create(&path, &key_hex, "vault").unwrap();
+        let db = LockedDb::create(&path, &key_hex, "vault", JournalMode::Wal).unwrap();
         shared_tests::create_read_task_with_and_without_dates(&db.store());
     }
 
@@ -322,7 +379,7 @@ mod tests {
         let path = dir.path().join("board.db");
         let salt = crypto::generate_salt();
         let key_hex = key_hex_for("hunter2", &salt);
-        let db = LockedDb::create(&path, &key_hex, "vault").unwrap();
+        let db = LockedDb::create(&path, &key_hex, "vault", JournalMode::Wal).unwrap();
         shared_tests::clear_deadline_via_patch_leaves_title_untouched(&db.store());
     }
 
@@ -332,7 +389,7 @@ mod tests {
         let path = dir.path().join("board.db");
         let salt = crypto::generate_salt();
         let key_hex = key_hex_for("hunter2", &salt);
-        let db = LockedDb::create(&path, &key_hex, "vault").unwrap();
+        let db = LockedDb::create(&path, &key_hex, "vault", JournalMode::Wal).unwrap();
         shared_tests::tag_upsert_is_idempotent_and_rejects_empty_name(&db.store());
     }
 
@@ -342,7 +399,7 @@ mod tests {
         let path = dir.path().join("board.db");
         let salt = crypto::generate_salt();
         let key_hex = key_hex_for("hunter2", &salt);
-        let db = LockedDb::create(&path, &key_hex, "vault").unwrap();
+        let db = LockedDb::create(&path, &key_hex, "vault", JournalMode::Wal).unwrap();
         shared_tests::tag_rename_and_delete(&db.store());
     }
 
@@ -352,7 +409,7 @@ mod tests {
         let path = dir.path().join("board.db");
         let salt = crypto::generate_salt();
         let key_hex = key_hex_for("hunter2", &salt);
-        let db = LockedDb::create(&path, &key_hex, "vault").unwrap();
+        let db = LockedDb::create(&path, &key_hex, "vault", JournalMode::Wal).unwrap();
         shared_tests::set_task_tags_replaces_whole_set_and_reads_back(&db.store());
     }
 
@@ -362,7 +419,7 @@ mod tests {
         let path = dir.path().join("board.db");
         let salt = crypto::generate_salt();
         let key_hex = key_hex_for("hunter2", &salt);
-        let db = LockedDb::create(&path, &key_hex, "vault").unwrap();
+        let db = LockedDb::create(&path, &key_hex, "vault", JournalMode::Wal).unwrap();
         shared_tests::deleting_task_cascades_its_tags(&db.store());
     }
 
@@ -372,7 +429,7 @@ mod tests {
         let path = dir.path().join("board.db");
         let salt = crypto::generate_salt();
         let key_hex = key_hex_for("hunter2", &salt);
-        let db = LockedDb::create(&path, &key_hex, "vault").unwrap();
+        let db = LockedDb::create(&path, &key_hex, "vault", JournalMode::Wal).unwrap();
         shared_tests::tags_load_with_list_tasks_for_many_tasks(&db.store());
     }
 
@@ -382,7 +439,7 @@ mod tests {
         let path = dir.path().join("board.db");
         let salt = crypto::generate_salt();
         let key_hex = key_hex_for("hunter2", &salt);
-        let db = LockedDb::create(&path, &key_hex, "vault").unwrap();
+        let db = LockedDb::create(&path, &key_hex, "vault", JournalMode::Wal).unwrap();
         shared_tests::move_task_sets_and_clears_completed_at(&db.store());
     }
 
@@ -392,7 +449,7 @@ mod tests {
         let path = dir.path().join("board.db");
         let salt = crypto::generate_salt();
         let key_hex = key_hex_for("hunter2", &salt);
-        let db = LockedDb::create(&path, &key_hex, "vault").unwrap();
+        let db = LockedDb::create(&path, &key_hex, "vault", JournalMode::Wal).unwrap();
         shared_tests::create_task_directly_in_done_sets_completed_at(&db.store());
     }
 }

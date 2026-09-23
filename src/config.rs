@@ -13,6 +13,7 @@ pub struct Config {
     pub lock_on_board_switch: bool,
     pub confirm_delete: bool,
     pub show_keyhints: bool,
+    pub journal_mode: JournalMode,
     pub theme: Theme,
 }
 
@@ -25,6 +26,7 @@ impl Default for Config {
             lock_on_board_switch: true,
             confirm_delete: true,
             show_keyhints: true,
+            journal_mode: JournalMode::default(),
             theme: Theme::default(),
         }
     }
@@ -81,11 +83,27 @@ impl Default for Theme {
             deadline_near: "#ff8700".to_string(),
             // less than 2 days
             deadline_imminent: "red".to_string(),
-            // overdue: white on black
+            // overdue: white on purple
             deadline_overdue_fg: "white".to_string(),
-            deadline_overdue_bg: "black".to_string(),
+            deadline_overdue_bg: "#8700af".to_string(),
         }
     }
+}
+
+/// SQLite's on-disk journal. `journal_mode = "wal"` (default) is fast but
+/// splits each database into three files (`.db`, `-wal`, `-shm`) that a
+/// sync tool like Dropbox or Syncthing can see and replace independently,
+/// out of step with each other. `journal_mode = "delete"` uses SQLite's
+/// classic rollback journal instead: slower, but each database is one
+/// self-contained file on disk between writes, which is what belongs in a
+/// synced folder. Applies to `main.db` and to every locked board's own
+/// encrypted file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JournalMode {
+    #[default]
+    Wal,
+    Delete,
 }
 
 /// Resolved filesystem locations for this run.
@@ -446,5 +464,27 @@ todo = "cyan"
         let lookup = |_: &str| false;
         let result = resolve_editor(&cfg, &lookup, None, None);
         assert!(result.is_err());
+    }
+
+    // --- journal_mode ------------------------------------------------------
+
+    #[test]
+    fn journal_mode_defaults_to_wal() {
+        let cfg = Config::default();
+        assert_eq!(cfg.journal_mode, JournalMode::Wal);
+    }
+
+    #[test]
+    fn journal_mode_parses_wal_and_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        std::fs::write(&path, "journal_mode = \"wal\"\n").unwrap();
+        let cfg = load_from_path(&path).unwrap();
+        assert_eq!(cfg.journal_mode, JournalMode::Wal);
+
+        std::fs::write(&path, "journal_mode = \"delete\"\n").unwrap();
+        let cfg = load_from_path(&path).unwrap();
+        assert_eq!(cfg.journal_mode, JournalMode::Delete);
     }
 }

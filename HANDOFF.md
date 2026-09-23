@@ -182,7 +182,7 @@ conveyed by which column a card sits in:
 | 14–5 days | yellow |
 | 4–2 days | orange (256-colour 208; degrades to yellow at 16 colours) |
 | less than 2 days | red |
-| overdue | black background, white text |
+| overdue | **purple** background (`#8700af`, 256-index 91, magenta at 16 colours), white text |
 
 The user's stated ranges leave exactly 15 days unassigned; 15 is treated as
 green (`Urgency::Distant`).
@@ -288,10 +288,19 @@ and the help popup showing `A`.
    glibc skew between Debian 13 (2.41) and Mint 22 (2.39). **Blocked**: needs
    `sudo apt install musl-tools`, which was never run. Building natively on the
    Mint machine (`./install.sh`) is the alternative.
-7. **The tmux floating editor is not verified against a real tmux popup.** The
-   `editor_invocation` split is unit-tested both ways, but nobody has watched
-   `tmux display-popup` actually run nvim over the board. The suspend/restore
-   sequence is still applied in the tmux path, which may be unnecessary.
+7. **The tmux floating editor now hovers over the board, but is still not
+   verified against a real tmux popup.** `edit_text` (`src/editor.rs`) no
+   longer applies the suspend/restore sequence in the tmux path: raw mode and
+   the alternate screen are left untouched, so the board stays drawn
+   underneath the floating `tmux display-popup`, titled with the task's (or
+   form's) title via `-T`. The `tmux` client's own stdio is `/dev/null` so it
+   cannot write into the pane, and any crossterm input queued while the popup
+   had focus is drained (non-blocking) once it exits. Outside tmux, the
+   suspend/restore sequence is unchanged. The tmux/no-tmux decision is now
+   the pure `needs_suspend` function, unit-tested both ways, and
+   `editor_invocation`'s argument list (including `-T`) is unit-tested too --
+   but nobody has yet watched `tmux display-popup` actually float over the
+   board in a real terminal. Verify in a real tmux session.
 8. Undo/redo is in-memory per session and does not survive a restart. Normal for
    a vim-style tool; confirm with the user if persistence is wanted.
 9. **Archive browser filter cannot contain `j`/`k`** because those keys
@@ -327,3 +336,38 @@ an application hang; and `pkill -f 'target/debug/tsk'` also matches the harness'
 own shell wrapper and kills the test. Subagent reports were repeatedly correct
 about unit tests and wrong about real-terminal behaviour — the editor data-loss
 bug passed 149 tests and only showed up under a real pty. Verify in a pty.
+
+---
+
+## Dropbox two-machine setup and the two features that make it safe
+
+The user runs `tsk` on two machines, never simultaneously, with the data
+directory itself living in Dropbox (`/home/herpich/Dropbox/task-manager/data`,
+git-ignored) so both machines share one set of boards. Two things had to be
+true for that to be safe, and both are done:
+
+1. **`journal_mode = "delete"` in config.** WAL mode (the default) splits a
+   database into three files (`.db`, `-wal`, `-shm`); Dropbox syncs them
+   independently and out of step, which can corrupt the WAL or checkpoint
+   against a stale `-shm`. With `journal_mode = "delete"`, `MainDb::open` and
+   `LockedDb::create`/`open` all issue `PRAGMA journal_mode = DELETE` instead
+   of `WAL` -- every write lands in the single `.db` file, which is what a
+   syncing tool can safely replace whole. Setting it on an existing WAL
+   database converts it and checkpoints (then removes) any leftover `-wal`
+   file in that same pragma call; no extra step is needed.
+2. **External-change detection.** Dropbox replaces `main.db` (new inode) when
+   it syncs the other machine's write; a `tsk` left running would otherwise
+   keep writing to the orphaned old file. `App` fingerprints (device, inode,
+   length, mtime) `main.db` and, if unlocked, the active locked board's file,
+   recording a fresh one at the end of every `reload()` (which every mutating
+   action already goes through, so the app's own writes never look like an
+   external change). The event loop's ~250ms tick calls
+   `App::check_external_change`, rate-limited to about once a second; on a
+   mismatch it reopens the main connection. `App` does not retain the
+   passphrase-derived key after unlocking a board -- only the open `LockedDb`
+   connection -- so if the locked board's own file changed too, it is locked
+   cleanly rather than reopened, with a message asking the user to re-enter
+   the passphrase. Undo/redo is cleared (row ids may no longer be valid) and
+   the status line reads "reloaded: database changed on disk". A manual
+   reload is also reachable via `:e` or `:reload`, both of which now bind to
+   `Action::Refresh` (previously defined but unbound).

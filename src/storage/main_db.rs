@@ -1,7 +1,8 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension};
 
+use crate::config::JournalMode;
 use crate::domain::board::{Board, BoardId, BoardKind};
 use crate::domain::note::{Note, NoteId};
 use crate::domain::task::{NewTask, Status, Tag, TagId, Task, TaskId, TaskPatch};
@@ -42,10 +43,11 @@ fn board_from_row(raw: BoardRow) -> Result<Board, StorageError> {
 
 pub struct MainDb {
     conn: Connection,
+    path: Option<PathBuf>,
 }
 
 impl MainDb {
-    pub fn open(path: &Path) -> Result<Self, StorageError> {
+    pub fn open(path: &Path, journal_mode: JournalMode) -> Result<Self, StorageError> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
@@ -55,20 +57,35 @@ impl MainDb {
         let conn = Connection::open(path)?;
         // Before the first write, so the WAL/SHM sidecars inherit 0600.
         crate::storage::harden_file(path)?;
-        Self::init_conn(&conn, true)?;
-        Ok(Self { conn })
+        Self::init_conn(&conn, Some(journal_mode))?;
+        Ok(Self { conn, path: Some(path.to_path_buf()) })
     }
 
     pub fn open_in_memory() -> Result<Self, StorageError> {
         let conn = Connection::open_in_memory()?;
-        Self::init_conn(&conn, false)?;
-        Ok(Self { conn })
+        Self::init_conn(&conn, None)?;
+        Ok(Self { conn, path: None })
     }
 
-    fn init_conn(conn: &Connection, wal: bool) -> Result<(), StorageError> {
+    /// The on-disk path this connection was opened from, or `None` for an
+    /// in-memory connection (every test uses one). Used by
+    /// `App::check_external_change` to fingerprint and, if needed, reopen
+    /// this database.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// `journal_mode` is `None` only for an in-memory connection, which has
+    /// no journal file to choose a mode for. Setting `PRAGMA journal_mode =
+    /// DELETE` on a database currently in WAL mode converts it and
+    /// checkpoints -- then removes -- any leftover `-wal`/`-shm` sidecars as
+    /// part of that same pragma; no separate step is needed.
+    fn init_conn(conn: &Connection, journal_mode: Option<JournalMode>) -> Result<(), StorageError> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-        if wal {
-            conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+        match journal_mode {
+            Some(JournalMode::Wal) => conn.execute_batch("PRAGMA journal_mode = WAL;")?,
+            Some(JournalMode::Delete) => conn.execute_batch("PRAGMA journal_mode = DELETE;")?,
+            None => {}
         }
         conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
         migrations::apply(conn, migrations::MIGRATIONS_MAIN)?;
@@ -309,11 +326,45 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sub").join("main.db");
-        let _db = MainDb::open(&path).unwrap();
+        let _db = MainDb::open(&path, JournalMode::Wal).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "main.db holds plaintext tasks; it must be owner-only");
         let dmode = std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode();
         assert_eq!(dmode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn main_db_delete_mode_reports_delete_journal_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.db");
+        let db = MainDb::open(&path, JournalMode::Delete).unwrap();
+        let mode: String = db.conn.query_row("PRAGMA journal_mode", [], |row| row.get(0)).unwrap();
+        assert_eq!(mode, "delete");
+        assert_eq!(db.path(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn reopening_wal_db_with_delete_converts_and_keeps_rows_no_wal_file_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.db");
+        {
+            let db = MainDb::open(&path, JournalMode::Wal).unwrap();
+            let board_id = db.create_board("alpha", BoardKind::Plain).unwrap();
+            db.store_for(board_id).create_task(new_task("keep me", Status::ToDo)).unwrap();
+        }
+
+        {
+            let db = MainDb::open(&path, JournalMode::Delete).unwrap();
+            let mode: String = db.conn.query_row("PRAGMA journal_mode", [], |row| row.get(0)).unwrap();
+            assert_eq!(mode, "delete");
+            let board = db.get_board_by_name("alpha").unwrap().unwrap();
+            let tasks = db.store_for(board.id).list_tasks(Status::ToDo).unwrap();
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0].title, "keep me");
+        }
+
+        let wal_path = dir.path().join("main.db-wal");
+        assert!(!wal_path.exists(), "no -wal file should remain after switching to DELETE mode and closing");
     }
 
     #[test]

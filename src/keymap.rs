@@ -22,6 +22,11 @@ pub struct Binding {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ctx {
     Board,
+    /// Arrow-key equivalents of the Board `h/l`/`j/k` navigation. A
+    /// separate context so these show up in the `?` help screen (which
+    /// lists Board alongside it) without lengthening the footer's Board
+    /// hint line, which only pulls `Ctx::Board` itself.
+    BoardArrows,
     Notes,
     Global,
     Help,
@@ -41,6 +46,9 @@ pub const BINDINGS: &[Binding] = &[
     Binding { keys: "j/k", label: "move", rank: 0, ctx: Ctx::Board },
     Binding { keys: "gg/G", label: "top/bottom", rank: 2, ctx: Ctx::Board },
     Binding { keys: "^d/^u", label: "half pg", rank: 3, ctx: Ctx::Board },
+    // --- Board: arrow-key equivalents of h/l/j/k, help-only (see Ctx::BoardArrows) --
+    Binding { keys: "\u{2190}/\u{2192}", label: "col", rank: 0, ctx: Ctx::BoardArrows },
+    Binding { keys: "\u{2191}/\u{2193}", label: "move", rank: 0, ctx: Ctx::BoardArrows },
     // --- Board: task actions (live in Phase 5) ------------------------
     Binding { keys: "a/i", label: "new task", rank: 1, ctx: Ctx::Board },
     Binding { keys: "e", label: "edit", rank: 1, ctx: Ctx::Board },
@@ -185,10 +193,10 @@ pub fn resolve(
         (true, KeyCode::Char('d')) => Action::HalfPageDown,
         (true, KeyCode::Char('u')) => Action::HalfPageUp,
         (true, KeyCode::Char('r')) => Action::Redo,
-        (false, KeyCode::Char('h')) => Action::FocusPrevColumn,
-        (false, KeyCode::Char('l')) => Action::FocusNextColumn,
-        (false, KeyCode::Char('j')) => Action::MoveDown(pending.take_count(1)),
-        (false, KeyCode::Char('k')) => Action::MoveUp(pending.take_count(1)),
+        (false, KeyCode::Char('h') | KeyCode::Left) => Action::FocusPrevColumn,
+        (false, KeyCode::Char('l') | KeyCode::Right) => Action::FocusNextColumn,
+        (false, KeyCode::Char('j') | KeyCode::Down) => Action::MoveDown(pending.take_count(1)),
+        (false, KeyCode::Char('k') | KeyCode::Up) => Action::MoveUp(pending.take_count(1)),
         (false, KeyCode::Char('g')) => {
             pending.set_prefix('g');
             Action::Nop
@@ -262,6 +270,36 @@ mod tests {
         assert_eq!(resolve_n(Mode::Normal, false, KeyCode::Char('j'), &mut p), Action::MoveDown(1));
         assert_eq!(resolve_n(Mode::Normal, false, KeyCode::Char('k'), &mut p), Action::MoveUp(1));
         assert_eq!(resolve_n(Mode::Normal, false, KeyCode::Char('G'), &mut p), Action::MoveBottom);
+    }
+
+    #[test]
+    fn arrow_keys_resolve_like_hjkl() {
+        let mut p = PendingSeq::default();
+        assert_eq!(resolve_n(Mode::Normal, false, KeyCode::Left, &mut p), Action::FocusPrevColumn);
+        assert_eq!(resolve_n(Mode::Normal, false, KeyCode::Right, &mut p), Action::FocusNextColumn);
+        assert_eq!(resolve_n(Mode::Normal, false, KeyCode::Down, &mut p), Action::MoveDown(1));
+        assert_eq!(resolve_n(Mode::Normal, false, KeyCode::Up, &mut p), Action::MoveUp(1));
+    }
+
+    #[test]
+    fn count_applies_to_arrow_keys_same_as_jk() {
+        let mut p = PendingSeq::default();
+        assert_eq!(resolve_n(Mode::Normal, false, KeyCode::Char('3'), &mut p), Action::Nop);
+        assert_eq!(resolve_n(Mode::Normal, false, KeyCode::Down, &mut p), Action::MoveDown(3));
+        assert_eq!(p.count, None);
+
+        assert_eq!(resolve_n(Mode::Normal, false, KeyCode::Char('2'), &mut p), Action::Nop);
+        assert_eq!(resolve_n(Mode::Normal, false, KeyCode::Up, &mut p), Action::MoveUp(2));
+    }
+
+    #[test]
+    fn board_arrows_hint_context_is_nonempty_and_distinct_from_board() {
+        let arrow_hints = hints_for(Ctx::BoardArrows);
+        assert!(!arrow_hints.is_empty());
+        assert!(arrow_hints.iter().all(|b| b.ctx == Ctx::BoardArrows));
+        // The footer only ever asks for `Ctx::Board`, so these entries
+        // must not show up there and lengthen the hint bar.
+        assert!(hints_for(Ctx::Board).iter().all(|b| b.ctx != Ctx::BoardArrows));
     }
 
     #[test]

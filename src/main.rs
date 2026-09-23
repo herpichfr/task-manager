@@ -63,7 +63,7 @@ fn run() -> Result<()> {
 
     let requested_board = cli.board.clone();
 
-    let db = MainDb::open(&paths.db_dir.join("main.db")).map_err(app::storage_err)?;
+    let db = MainDb::open(&paths.db_dir.join("main.db"), config.journal_mode).map_err(app::storage_err)?;
     let board = app::bootstrap_and_select_board(
         &db,
         requested_board.as_deref(),
