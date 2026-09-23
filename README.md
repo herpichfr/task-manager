@@ -260,4 +260,4 @@ directory instead of your real data.
 
 ## License
 
-MIT. See [`Cargo.toml`](Cargo.toml).
+MIT. See [`LICENSE`](LICENSE).
