@@ -298,9 +298,9 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         assert_eq!(migrations::current_version(&conn).unwrap(), 0);
         migrations::apply(&conn, migrations::MIGRATIONS_MAIN).unwrap();
-        assert_eq!(migrations::current_version(&conn).unwrap(), 2);
+        assert_eq!(migrations::current_version(&conn).unwrap(), 3);
         migrations::apply(&conn, migrations::MIGRATIONS_MAIN).unwrap();
-        assert_eq!(migrations::current_version(&conn).unwrap(), 2);
+        assert_eq!(migrations::current_version(&conn).unwrap(), 3);
     }
 
     #[cfg(unix)]
@@ -715,6 +715,20 @@ mod tests {
         let db = MainDb::open_in_memory().unwrap();
         let board_id = db.create_board("alpha", BoardKind::Plain).unwrap();
         shared_tests::tags_load_with_list_tasks_for_many_tasks(&db.store_for(board_id));
+    }
+
+    #[test]
+    fn move_task_sets_and_clears_completed_at() {
+        let db = MainDb::open_in_memory().unwrap();
+        let board_id = db.create_board("alpha", BoardKind::Plain).unwrap();
+        shared_tests::move_task_sets_and_clears_completed_at(&db.store_for(board_id));
+    }
+
+    #[test]
+    fn create_task_directly_in_done_sets_completed_at() {
+        let db = MainDb::open_in_memory().unwrap();
+        let board_id = db.create_board("alpha", BoardKind::Plain).unwrap();
+        shared_tests::create_task_directly_in_done_sets_completed_at(&db.store_for(board_id));
     }
 
     #[test]

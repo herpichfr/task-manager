@@ -188,6 +188,7 @@ impl FormState {
         status: Status,
         start_date: Option<i64>,
         deadline: Option<i64>,
+        tags: Vec<String>,
     ) -> Self {
         let cursor = title.len();
         let start_text = start_date.map(dates::format_date).unwrap_or_default();
@@ -200,7 +201,7 @@ impl FormState {
             cursor,
             status,
             priority,
-            tags: Vec::new(),
+            tags,
             start_text,
             start_cursor,
             deadline_text,
@@ -412,22 +413,11 @@ impl FormState {
         PopupOutcome::Consumed
     }
 
-    fn handle_tags_key(&mut self, key: KeyEvent) -> PopupOutcome {
-        if key.code == KeyCode::Enter {
-            let mut items: Vec<SelectItem> = self
-                .tags
-                .iter()
-                .enumerate()
-                .map(|(i, t)| SelectItem { id: i as i64, label: t.clone() })
-                .collect();
-            items.push(SelectItem { id: -1, label: "+ new tag…".to_string() });
-            return PopupOutcome::Push(Box::new(Popup::Dropdown(DropdownState {
-                title: "Tags".to_string(),
-                items,
-                selected: 0,
-                target: DropdownTarget::Tag,
-            })));
-        }
+    /// Enter on this field is intercepted by `App::route_key_to_popup`
+    /// before it reaches here, since building the board-wide tag list
+    /// needs the store, which `FormState` deliberately has no access to.
+    /// Any other key on this field does nothing.
+    fn handle_tags_key(&mut self, _key: KeyEvent) -> PopupOutcome {
         PopupOutcome::Consumed
     }
 
@@ -436,26 +426,34 @@ impl FormState {
     /// `self.field` is `Status`, `Priority`, or `Tags`, since those are the
     /// only fields that push a child popup.
     pub fn receive(&mut self, value: PopupValue) {
-        let PopupValue::Selected(item) = value else {
-            return;
-        };
-        match self.field {
-            Field::Status => {
+        match (self.field, value) {
+            (Field::Status, PopupValue::Selected(item)) => {
                 if let Some(s) = Status::ALL.get(item.id as usize) {
                     self.status = *s;
                 }
             }
-            Field::Priority => {
+            (Field::Priority, PopupValue::Selected(item)) => {
                 if let Some(p) = Priority::ALL.iter().find(|p| **p as i64 == item.id) {
                     self.priority = *p;
                 }
             }
-            // The form's own Tags field stays local-only, as before this
-            // phase: real tag persistence is via the card-level `t`
-            // dropdown (`App::open_tag_picker`), which this form does not
-            // go through.
-            Field::Tags if item.id == -1 && !self.tags.contains(&item.label) => {
-                self.tags.push(item.label);
+            // The "+ new tag…" row of the form-scoped tag picker
+            // (`App::open_form_tag_picker`) replaces itself with a
+            // one-line `TextPrompt`; this form is still underneath it on
+            // the popup stack, so the typed name arrives here rather than
+            // through `App::apply_text`. Persisted for real -- upserted by
+            // name and attached via `set_task_tags` -- only when the form
+            // itself is submitted (`try_submit`).
+            (Field::Tags, PopupValue::Text(name)) => {
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    self.error = Some("tag name must not be empty".to_string());
+                } else {
+                    self.error = None;
+                    if !self.tags.contains(&name) {
+                        self.tags.push(name);
+                    }
+                }
             }
             _ => {}
         }
@@ -727,7 +725,7 @@ mod tests {
 
     #[test]
     fn clearing_date_text_clears_the_date_on_submit() {
-        let mut f = FormState::edit_task(1, "t".to_string(), String::new(), Priority::Normal, Status::ToDo, Some(1_700_000_000), None);
+        let mut f = FormState::edit_task(1, "t".to_string(), String::new(), Priority::Normal, Status::ToDo, Some(1_700_000_000), None, Vec::new());
         assert_eq!(f.start_text, dates::format_date(1_700_000_000));
         f.start_text.clear();
         let outcome = f.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
@@ -747,9 +745,62 @@ mod tests {
             Status::Doing,
             Some(1_700_000_000),
             Some(1_800_000_000),
+            Vec::new(),
         );
         assert_eq!(f.status, Status::Doing);
         assert_eq!(f.start_text, dates::format_date(1_700_000_000));
         assert_eq!(f.deadline_text, dates::format_date(1_800_000_000));
+    }
+
+    #[test]
+    fn edit_task_prefills_tags() {
+        let f = FormState::edit_task(
+            5,
+            "title".to_string(),
+            "body".to_string(),
+            Priority::High,
+            Status::Doing,
+            None,
+            None,
+            vec!["home".to_string(), "urgent".to_string()],
+        );
+        assert_eq!(f.tags, vec!["home".to_string(), "urgent".to_string()]);
+    }
+
+    #[test]
+    fn receive_text_on_tags_field_appends_a_new_tag() {
+        let mut f = FormState::new_task(Status::ToDo);
+        f.field = Field::Tags;
+        f.receive(PopupValue::Text("urgent".to_string()));
+        assert_eq!(f.tags, vec!["urgent".to_string()]);
+    }
+
+    #[test]
+    fn receive_text_on_tags_field_ignores_a_duplicate() {
+        let mut f = FormState::new_task(Status::ToDo);
+        f.field = Field::Tags;
+        f.tags.push("urgent".to_string());
+        f.receive(PopupValue::Text("urgent".to_string()));
+        assert_eq!(f.tags, vec!["urgent".to_string()]);
+    }
+
+    #[test]
+    fn receive_empty_text_on_tags_field_sets_an_inline_error() {
+        let mut f = FormState::new_task(Status::ToDo);
+        f.field = Field::Tags;
+        f.receive(PopupValue::Text("   ".to_string()));
+        assert!(f.tags.is_empty());
+        assert_eq!(f.error.as_deref(), Some("tag name must not be empty"));
+    }
+
+    #[test]
+    fn receive_text_clears_stale_error() {
+        let mut f = FormState::new_task(Status::ToDo);
+        f.field = Field::Tags;
+        f.receive(PopupValue::Text("   ".to_string()));
+        assert_eq!(f.error.as_deref(), Some("tag name must not be empty"));
+        f.receive(PopupValue::Text("home".to_string()));
+        assert_eq!(f.error, None);
+        assert_eq!(f.tags, vec!["home".to_string()]);
     }
 }

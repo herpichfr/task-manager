@@ -36,6 +36,7 @@ type RawTaskRow = (
     i64,
     Option<i64>,
     Option<i64>,
+    Option<i64>,
 );
 
 fn row_to_raw_task(row: &rusqlite::Row) -> rusqlite::Result<RawTaskRow> {
@@ -50,11 +51,12 @@ fn row_to_raw_task(row: &rusqlite::Row) -> rusqlite::Result<RawTaskRow> {
         row.get(7)?,
         row.get(8)?,
         row.get(9)?,
+        row.get(10)?,
     ))
 }
 
 fn task_from_parts(board_id: Option<BoardId>, raw: RawTaskRow) -> Result<Task, StorageError> {
-    let (id, title, body, status, priority, position, created_at, updated_at, start_date, deadline) = raw;
+    let (id, title, body, status, priority, position, created_at, updated_at, start_date, deadline, completed_at) = raw;
     let status = Status::from_str(&status).ok_or_else(|| StorageError::InvalidEnum(status.clone()))?;
     let priority = Priority::from_str(&priority).ok_or_else(|| StorageError::InvalidEnum(priority.clone()))?;
     Ok(Task {
@@ -69,6 +71,7 @@ fn task_from_parts(board_id: Option<BoardId>, raw: RawTaskRow) -> Result<Task, S
         updated_at,
         start_date,
         deadline,
+        completed_at,
         tags: Vec::new(),
     })
 }
@@ -85,7 +88,7 @@ fn note_from_parts(board_id: Option<BoardId>, raw: RawNoteRow) -> Note {
 }
 
 const TASK_COLUMNS: &str =
-    "id, title, body, status, priority, position, created_at, updated_at, start_date, deadline";
+    "id, title, body, status, priority, position, created_at, updated_at, start_date, deadline, completed_at";
 
 /// Loads the tags for several tasks in one query (`task_id IN (...)`),
 /// grouped by `task_id`. Called once per `list_tasks`/`get_task` call
@@ -163,6 +166,10 @@ pub(crate) fn get_task(conn: &Connection, board_id: Option<BoardId>, id: TaskId)
 
 pub(crate) fn create_task(conn: &Connection, board_id: Option<BoardId>, draft: NewTask) -> Result<TaskId, StorageError> {
     let now = chrono::Utc::now().timestamp();
+    // A task created directly into Done (e.g. `a` while the Done column is
+    // focused, or a note promoted straight there) has entered Done at
+    // creation time, same as `move_task` stamps it on every other route.
+    let completed_at: Option<i64> = if draft.status == Status::Done { Some(now) } else { None };
     let next_position: i64 = match board_id {
         Some(bid) => conn.query_row(
             "SELECT COALESCE(MAX(position), -1) + 1 FROM tasks WHERE board_id = ?1 AND status = ?2",
@@ -177,8 +184,8 @@ pub(crate) fn create_task(conn: &Connection, board_id: Option<BoardId>, draft: N
     };
     match board_id {
         Some(bid) => conn.execute(
-            "INSERT INTO tasks (board_id, title, body, status, priority, position, created_at, updated_at, start_date, deadline)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9)",
+            "INSERT INTO tasks (board_id, title, body, status, priority, position, created_at, updated_at, start_date, deadline, completed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 bid,
                 draft.title,
@@ -188,12 +195,13 @@ pub(crate) fn create_task(conn: &Connection, board_id: Option<BoardId>, draft: N
                 next_position,
                 now,
                 draft.start_date,
-                draft.deadline
+                draft.deadline,
+                completed_at
             ],
         )?,
         None => conn.execute(
-            "INSERT INTO tasks (title, body, status, priority, position, created_at, updated_at, start_date, deadline)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8)",
+            "INSERT INTO tasks (title, body, status, priority, position, created_at, updated_at, start_date, deadline, completed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9)",
             rusqlite::params![
                 draft.title,
                 draft.body,
@@ -202,7 +210,8 @@ pub(crate) fn create_task(conn: &Connection, board_id: Option<BoardId>, draft: N
                 next_position,
                 now,
                 draft.start_date,
-                draft.deadline
+                draft.deadline,
+                completed_at
             ],
         )?,
     };
@@ -308,9 +317,15 @@ pub(crate) fn move_task(conn: &Connection, board_id: Option<BoardId>, id: TaskId
     }
 
     let now = chrono::Utc::now().timestamp();
+    // The single choke point every route that changes a task's status goes
+    // through (H/L, the m/S dropdown, the edit form's status change, and
+    // undo/redo of any of those, which all re-invoke this same function) --
+    // so stamping `completed_at` here, and nowhere else, is what keeps it
+    // correct everywhere at once.
+    let completed_at: Option<i64> = if to == Status::Done { Some(now) } else { None };
     tx.execute(
-        "UPDATE tasks SET status = ?1, position = ?2, updated_at = ?3 WHERE id = ?4",
-        rusqlite::params![to.as_str(), clamped_index, now, id],
+        "UPDATE tasks SET status = ?1, position = ?2, updated_at = ?3, completed_at = ?4 WHERE id = ?5",
+        rusqlite::params![to.as_str(), clamped_index, now, completed_at, id],
     )?;
 
     tx.commit()?;
@@ -447,6 +462,9 @@ pub(crate) fn promote_note(conn: &Connection, board_id: Option<BoardId>, id: Not
     let rest = lines.next().unwrap_or("").trim().to_string();
 
     let now = chrono::Utc::now().timestamp();
+    // Same as `create_task`: a note promoted straight to Done has entered
+    // Done at creation time.
+    let completed_at: Option<i64> = if status == Status::Done { Some(now) } else { None };
     let next_position: i64 = match board_id {
         Some(bid) => tx.query_row(
             "SELECT COALESCE(MAX(position), -1) + 1 FROM tasks WHERE board_id = ?1 AND status = ?2",
@@ -461,14 +479,23 @@ pub(crate) fn promote_note(conn: &Connection, board_id: Option<BoardId>, id: Not
     };
     match board_id {
         Some(bid) => tx.execute(
-            "INSERT INTO tasks (board_id, title, body, status, priority, position, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-            rusqlite::params![bid, title, rest, status.as_str(), Priority::default().as_str(), next_position, now],
+            "INSERT INTO tasks (board_id, title, body, status, priority, position, created_at, updated_at, completed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)",
+            rusqlite::params![
+                bid,
+                title,
+                rest,
+                status.as_str(),
+                Priority::default().as_str(),
+                next_position,
+                now,
+                completed_at
+            ],
         )?,
         None => tx.execute(
-            "INSERT INTO tasks (title, body, status, priority, position, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-            rusqlite::params![title, rest, status.as_str(), Priority::default().as_str(), next_position, now],
+            "INSERT INTO tasks (title, body, status, priority, position, created_at, updated_at, completed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)",
+            rusqlite::params![title, rest, status.as_str(), Priority::default().as_str(), next_position, now, completed_at],
         )?,
     };
     let task_id = tx.last_insert_rowid();
@@ -699,6 +726,29 @@ pub(crate) mod shared_tests {
         assert_eq!(store.list_tags().unwrap().len(), 1);
         // The task is gone, so re-querying its tags must not resurrect it or panic.
         assert!(store.tags_for_task(task_id).unwrap().is_empty());
+    }
+
+    /// `move_task` is the single choke point every route that changes a
+    /// task's status goes through, so pinning its `completed_at` behaviour
+    /// here covers H/L, the m/S dropdown, the edit form's status change,
+    /// and undo/redo of any of them at once.
+    pub(crate) fn move_task_sets_and_clears_completed_at(store: &dyn TaskStore) {
+        let id = store.create_task(new_task("t")).unwrap();
+        assert_eq!(store.get_task(id).unwrap().completed_at, None);
+
+        store.move_task(id, Status::Done, 0).unwrap();
+        assert!(store.get_task(id).unwrap().completed_at.is_some());
+
+        store.move_task(id, Status::Doing, 0).unwrap();
+        assert_eq!(store.get_task(id).unwrap().completed_at, None);
+    }
+
+    pub(crate) fn create_task_directly_in_done_sets_completed_at(store: &dyn TaskStore) {
+        let id = store.create_task(NewTask { status: Status::Done, ..new_task("born done") }).unwrap();
+        assert!(store.get_task(id).unwrap().completed_at.is_some());
+
+        let id2 = store.create_task(new_task("born todo")).unwrap();
+        assert_eq!(store.get_task(id2).unwrap().completed_at, None);
     }
 
     pub(crate) fn tags_load_with_list_tasks_for_many_tasks(store: &dyn TaskStore) {

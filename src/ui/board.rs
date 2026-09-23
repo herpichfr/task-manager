@@ -92,6 +92,129 @@ fn card_line_text(task: &Task, inner_width: usize, now: i64) -> String {
     line
 }
 
+/// Maximum extra body-preview lines shown beneath the selected card in its
+/// focused column (the title/badge line itself is not counted).
+const PREVIEW_MAX_LINES: usize = 3;
+
+/// Greedily word-wraps already-whitespace-collapsed `words` into lines of
+/// at most `width` display characters. A single word wider than `width` is
+/// hard-split across as many lines as it needs, since there is no other way
+/// to make it fit.
+fn wrap_words(words: &[&str], width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for &word in words {
+        let word_len = word.chars().count();
+        if word_len > width {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            let mut rest = word;
+            while rest.chars().count() > width {
+                let piece: String = rest.chars().take(width).collect();
+                let piece_bytes = piece.len();
+                lines.push(piece);
+                rest = &rest[piece_bytes..];
+            }
+            current = rest.to_string();
+            continue;
+        }
+        if current.is_empty() {
+            current = word.to_string();
+        } else if current.chars().count() + 1 + word_len <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current = word.to_string();
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// Appends "…" to `line`, replacing its last character first if
+/// `line` is already `width` characters wide so the result never exceeds
+/// it.
+fn mark_truncated(line: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let count = line.chars().count();
+    if count < width {
+        format!("{line}…")
+    } else {
+        let mut out: String = line.chars().take(width.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// The selected card's body preview: up to `PREVIEW_MAX_LINES` lines, with
+/// whitespace (including newlines) collapsed and word-wrapped to `width`.
+/// Empty (or whitespace-only) `body` produces no lines at all, which is
+/// what tells `render_column` not to expand that card. When the wrapped
+/// text needs more than `PREVIEW_MAX_LINES` lines, it is cut there and the
+/// last shown line ends in "…".
+fn preview_lines(body: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let words: Vec<&str> = body.split_whitespace().collect();
+    if words.is_empty() {
+        return Vec::new();
+    }
+    let mut wrapped = wrap_words(&words, width);
+    if wrapped.len() > PREVIEW_MAX_LINES {
+        wrapped.truncate(PREVIEW_MAX_LINES);
+        if let Some(last) = wrapped.last_mut() {
+            *last = mark_truncated(last, width);
+        }
+    }
+    wrapped
+}
+
+/// Picks which contiguous run of `heights` (one entry per row about to be
+/// drawn, each its rendered height in terminal rows) to show in
+/// `available_height` rows, so the row at `sel_pos` is always fully
+/// visible. If the whole list already fits starting from the top, it is
+/// shown from the top unchanged -- a short column never scrolls. Otherwise
+/// the window is anchored so `sel_pos` is the last row shown, including as
+/// many rows before it as still fit: the minimal scroll that brings a
+/// selection below the fold back into view. Returns an inclusive
+/// `(start, end)` range into `heights`; `(0, 0)` for an empty `heights`.
+fn scroll_window(heights: &[usize], sel_pos: usize, available_height: usize) -> (usize, usize) {
+    if heights.is_empty() {
+        return (0, 0);
+    }
+    let sel_pos = sel_pos.min(heights.len() - 1);
+
+    let mut top_down_end = None;
+    let mut used = 0usize;
+    for (i, h) in heights.iter().enumerate() {
+        if used + h > available_height {
+            break;
+        }
+        used += h;
+        top_down_end = Some(i);
+    }
+    if let Some(end) = top_down_end {
+        if end >= sel_pos {
+            return (0, end);
+        }
+    }
+
+    let mut start = sel_pos;
+    let mut used = heights[sel_pos].min(available_height);
+    while start > 0 && used + heights[start - 1] <= available_height {
+        start -= 1;
+        used += heights[start];
+    }
+    (start, sel_pos)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_column(
     frame: &mut Frame,
@@ -117,6 +240,7 @@ fn render_column(
     let title = format!(" {} ({}) ", label, visible.len());
     let block = Block::bordered().title(Line::from(title)).border_style(status_style);
     let inner_width = area.width.saturating_sub(2) as usize;
+    let inner_height = area.height.saturating_sub(2) as usize;
 
     let items: Vec<ListItem> = if visible.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
@@ -124,9 +248,26 @@ fn render_column(
             styles.default.add_modifier(Modifier::DIM),
         )))]
     } else {
-        visible
+        // Each visible row's rendered height and (for the one row that
+        // expands, if any) its wrapped preview lines, computed once so both
+        // the scroll window below and the `ListItem`s built from it use
+        // exactly the same numbers -- feature 5's "selected-card preview"
+        // and its scroll-into-view requirement.
+        let mut heights: Vec<usize> = Vec::with_capacity(visible.len());
+        let mut previews: Vec<Vec<String>> = Vec::with_capacity(visible.len());
+        for (i, task) in &visible {
+            let expand = focused && *i == col.selected;
+            let lines = if expand { preview_lines(&task.body, inner_width) } else { Vec::new() };
+            heights.push(1 + lines.len());
+            previews.push(lines);
+        }
+        let sel_pos = visible.iter().position(|(i, _)| *i == col.selected).unwrap_or(0);
+        let (start, end) = scroll_window(&heights, sel_pos, inner_height);
+
+        visible[start..=end]
             .iter()
-            .map(|(i, task)| {
+            .zip(previews[start..=end].iter())
+            .map(|((i, task), preview)| {
                 let urgency = dates::urgency(task.deadline, now);
                 let base_style = styles.for_urgency(urgency);
                 let text = card_line_text(task, inner_width, now);
@@ -140,7 +281,10 @@ fn render_column(
                 } else {
                     base_style
                 };
-                ListItem::new(Line::from(Span::styled(text, style)))
+
+                let mut lines = vec![Line::from(Span::styled(text, style))];
+                lines.extend(preview.iter().map(|p| Line::from(Span::styled(p.clone(), style))));
+                ListItem::new(lines)
             })
             .collect()
     };
@@ -418,6 +562,7 @@ mod tests {
             updated_at: 0,
             start_date: None,
             deadline: Some(3 * 86_400),
+            completed_at: None,
             tags: Vec::new(),
         };
         let line = card_line_text(&task, 30, now);
@@ -441,6 +586,7 @@ mod tests {
             updated_at: 0,
             start_date: None,
             deadline: Some(-2 * 86_400),
+            completed_at: None,
             tags: Vec::new(),
         };
         let line = card_line_text(&task, 30, now);
@@ -461,6 +607,7 @@ mod tests {
             updated_at: 0,
             start_date: None,
             deadline: None,
+            completed_at: None,
             tags: Vec::new(),
         };
         let line = card_line_text(&task, 30, 0);
@@ -482,6 +629,7 @@ mod tests {
             updated_at: 0,
             start_date: None,
             deadline: None,
+            completed_at: None,
             tags: vec![Tag { id: 1, name: "home".to_string(), color: None }],
         };
         let line = card_line_text(&task, 40, 0);
@@ -560,5 +708,162 @@ mod tests {
         assert!(rendered.contains("call bank"), "rendered:\n{rendered}");
         assert!(!rendered.contains("buy milk"), "rendered:\n{rendered}");
         assert!(rendered.contains("ToDo (1)"), "rendered:\n{rendered}");
+    }
+
+    // --- selected-card body preview (feature 5) -----------------------------
+
+    #[test]
+    fn preview_lines_is_empty_for_an_empty_or_whitespace_only_body() {
+        assert!(preview_lines("", 20).is_empty());
+        assert!(preview_lines("   \n\t  ", 20).is_empty());
+    }
+
+    #[test]
+    fn preview_lines_collapses_whitespace_and_newlines() {
+        let lines = preview_lines("first   line\n\nsecond line", 80);
+        assert_eq!(lines, vec!["first line second line".to_string()]);
+    }
+
+    #[test]
+    fn preview_lines_wraps_more_words_per_line_at_a_wider_width() {
+        let body = "one two three four five six seven eight";
+        let narrow = preview_lines(body, 10);
+        let wide = preview_lines(body, 40);
+        assert!(narrow.len() > 1, "{narrow:?}");
+        assert_eq!(wide.len(), 1, "{wide:?}");
+        assert_eq!(wide[0], body);
+        for line in &narrow {
+            assert!(line.chars().count() <= 10, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn preview_lines_truncates_with_ellipsis_past_three_lines() {
+        let body = "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj";
+        let lines = preview_lines(body, 10);
+        assert_eq!(lines.len(), PREVIEW_MAX_LINES);
+        assert!(lines.last().unwrap().ends_with('…'), "{lines:?}");
+    }
+
+    #[test]
+    fn preview_lines_no_ellipsis_when_text_fits_exactly_in_three_lines() {
+        let body = "aaaa bbbb cccc";
+        let lines = preview_lines(body, 4);
+        assert_eq!(lines, vec!["aaaa", "bbbb", "cccc"]);
+        assert!(lines.iter().all(|l| !l.contains('…')));
+    }
+
+    #[test]
+    fn preview_lines_zero_width_is_empty() {
+        assert!(preview_lines("some body text", 0).is_empty());
+    }
+
+    #[test]
+    fn scroll_window_shows_from_top_when_everything_fits() {
+        let heights = [1, 1, 1];
+        assert_eq!(scroll_window(&heights, 0, 10), (0, 2));
+    }
+
+    #[test]
+    fn scroll_window_short_column_shown_from_top_even_when_selection_is_last() {
+        let heights = [1, 1, 1];
+        assert_eq!(scroll_window(&heights, 2, 10), (0, 2));
+    }
+
+    #[test]
+    fn scroll_window_scrolls_down_to_keep_a_tall_selection_visible() {
+        // Ten one-row items, budget for 4 rows, selection near the bottom.
+        let heights = [1; 10];
+        let (start, end) = scroll_window(&heights, 8, 4);
+        assert_eq!(end, 8);
+        assert_eq!(start, 5);
+    }
+
+    #[test]
+    fn scroll_window_accounts_for_a_taller_selected_row() {
+        // Row 3 (the selected/expanded one) is 4 rows tall; only 5 rows of
+        // budget, so at most one 1-row neighbour also fits.
+        let heights = [1, 1, 1, 4, 1, 1];
+        let (start, end) = scroll_window(&heights, 3, 5);
+        assert!(start <= 3 && end >= 3);
+        let total: usize = heights[start..=end].iter().sum();
+        assert!(total <= 5, "{total}");
+    }
+
+    #[test]
+    fn scroll_window_empty_heights_is_zero_zero() {
+        assert_eq!(scroll_window(&[], 0, 10), (0, 0));
+    }
+
+    fn app_with_task_body(body: &str) -> crate::app::App {
+        let db = MainDb::open_in_memory().unwrap();
+        let board_id = db.create_board("test", BoardKind::Plain).unwrap();
+        {
+            let store = db.store_for(board_id);
+            store
+                .create_task(NewTask {
+                    title: "the task".to_string(),
+                    body: body.to_string(),
+                    status: Status::ToDo,
+                    priority: Priority::Normal,
+                    start_date: None,
+                    deadline: None,
+                })
+                .unwrap();
+        }
+        let board = db.get_board_by_name("test").unwrap().unwrap();
+        crate::app::App::new(crate::config::Config::default(), db, board).unwrap()
+    }
+
+    #[test]
+    fn selected_card_in_focused_column_shows_a_body_preview() {
+        let app = app_with_task_body("this is the start of a longer task body");
+        let backend = Phase5TestBackend::new(80, 24);
+        let mut terminal = Phase5Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        let rendered = phase5_buffer_to_string(terminal.backend().buffer());
+        assert!(rendered.contains("this is the start"), "rendered:\n{rendered}");
+    }
+
+    #[test]
+    fn unfocused_columns_selected_card_does_not_expand() {
+        let mut app = app_with_task_body("should not appear because Doing is not focused");
+        app.focused = 1; // Doing has no tasks and is now focused; ToDo is not.
+        let backend = Phase5TestBackend::new(80, 24);
+        let mut terminal = Phase5Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        let rendered = phase5_buffer_to_string(terminal.backend().buffer());
+        assert!(!rendered.contains("should not appear"), "rendered:\n{rendered}");
+    }
+
+    #[test]
+    fn empty_body_does_not_expand_the_selected_card() {
+        let app = app_with_task_body("");
+        let backend = Phase5TestBackend::new(80, 10);
+        let mut terminal = Phase5Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        // No panic and no stray preview row is the assertion here; a
+        // dedicated non-empty-body test already covers the positive case.
+        let rendered = phase5_buffer_to_string(terminal.backend().buffer());
+        assert!(rendered.contains("the task"), "rendered:\n{rendered}");
+    }
+
+    #[test]
+    fn preview_wraps_more_at_a_wider_terminal_width() {
+        let body = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+        let app = app_with_task_body(body);
+
+        let narrow_backend = Phase5TestBackend::new(30, 24);
+        let mut narrow_terminal = Phase5Terminal::new(narrow_backend).unwrap();
+        narrow_terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        let narrow_rendered = phase5_buffer_to_string(narrow_terminal.backend().buffer());
+
+        let wide_backend = Phase5TestBackend::new(100, 24);
+        let mut wide_terminal = Phase5Terminal::new(wide_backend).unwrap();
+        wide_terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        let wide_rendered = phase5_buffer_to_string(wide_terminal.backend().buffer());
+
+        assert!(narrow_rendered.contains("alpha"), "narrow:\n{narrow_rendered}");
+        assert!(wide_rendered.contains("alpha beta gamma"), "wide:\n{wide_rendered}");
     }
 }

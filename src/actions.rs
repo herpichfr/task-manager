@@ -44,6 +44,7 @@ pub enum Action {
     OpenPriorityDropdown,
     OpenTagDropdown,
     OpenBoardSwitcher,
+    OpenArchiveBrowser,
 
     Undo,
     Redo,

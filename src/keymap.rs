@@ -31,6 +31,8 @@ pub enum Ctx {
     Passphrase,
     TextPrompt,
     TagPicker,
+    FormTagPicker,
+    Archive,
 }
 
 pub const BINDINGS: &[Binding] = &[
@@ -52,6 +54,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding { keys: "t", label: "tags", rank: 2, ctx: Ctx::Board },
     Binding { keys: "dd", label: "delete", rank: 1, ctx: Ctx::Board },
     Binding { keys: "c", label: "note", rank: 1, ctx: Ctx::Board },
+    Binding { keys: "A", label: "archive", rank: 2, ctx: Ctx::Board },
     // --- Notes pane ----------------------------------------------------
     Binding { keys: "a/i", label: "new note", rank: 1, ctx: Ctx::Notes },
     Binding { keys: "e", label: "edit", rank: 1, ctx: Ctx::Notes },
@@ -98,6 +101,17 @@ pub const BINDINGS: &[Binding] = &[
     Binding { keys: "r", label: "rename", rank: 2, ctx: Ctx::TagPicker },
     Binding { keys: "d", label: "delete", rank: 3, ctx: Ctx::TagPicker },
     Binding { keys: "Esc", label: "close", rank: 4, ctx: Ctx::TagPicker },
+
+    // --- Form-scoped tag picker (the task form's Tags field) -----------
+    Binding { keys: "Enter", label: "toggle/new tag", rank: 0, ctx: Ctx::FormTagPicker },
+    Binding { keys: "j/k", label: "move", rank: 1, ctx: Ctx::FormTagPicker },
+    Binding { keys: "Esc", label: "close", rank: 2, ctx: Ctx::FormTagPicker },
+
+    // --- Archive browser (`A` on the board) -----------------------------
+    Binding { keys: "Enter", label: "open", rank: 0, ctx: Ctx::Archive },
+    Binding { keys: "type", label: "filter", rank: 1, ctx: Ctx::Archive },
+    Binding { keys: "j/k", label: "move", rank: 1, ctx: Ctx::Archive },
+    Binding { keys: "Esc", label: "close", rank: 2, ctx: Ctx::Archive },
 ];
 
 /// Hints for the footer restricted to exactly the given context, sorted by
@@ -215,6 +229,7 @@ pub fn resolve(
         }
         (false, KeyCode::Char('n')) => Action::SearchNext,
         (false, KeyCode::Char('b')) => Action::OpenBoardSwitcher,
+        (false, KeyCode::Char('A')) => Action::OpenArchiveBrowser,
         (false, KeyCode::Char('u')) => Action::Undo,
         (false, KeyCode::Char('/')) => Action::StartSearch,
         (false, KeyCode::Char(':')) => Action::StartCommand,
@@ -376,12 +391,16 @@ mod tests {
         assert!(!hints_for(Ctx::Passphrase).is_empty());
         assert!(!hints_for(Ctx::TextPrompt).is_empty());
         assert!(!hints_for(Ctx::TagPicker).is_empty());
+        assert!(!hints_for(Ctx::FormTagPicker).is_empty());
         // A text prompt must not advertise the passphrase popup's "unlock".
         assert!(hints_for(Ctx::TextPrompt).iter().all(|b| b.label != "unlock"));
         // The tag picker must advertise rename and delete, which a plain
         // dropdown has no equivalent of.
         assert!(hints_for(Ctx::TagPicker).iter().any(|b| b.label == "rename"));
         assert!(hints_for(Ctx::TagPicker).iter().any(|b| b.label == "delete"));
+        // The form-scoped tag picker only toggles/creates -- it must not
+        // advertise the card-level picker's rename/delete.
+        assert!(hints_for(Ctx::FormTagPicker).iter().all(|b| b.label != "rename" && b.label != "delete"));
     }
 
     #[test]
@@ -391,6 +410,23 @@ mod tests {
             resolve_n(Mode::Normal, false, KeyCode::Char('S'), &mut p),
             Action::OpenColumnDropdown
         );
+    }
+
+    #[test]
+    fn shift_a_opens_the_archive_browser() {
+        let mut p = PendingSeq::default();
+        assert_eq!(
+            resolve_n(Mode::Normal, false, KeyCode::Char('A'), &mut p),
+            Action::OpenArchiveBrowser
+        );
+    }
+
+    #[test]
+    fn archive_context_hints_are_nonempty_and_advertise_open_and_filter() {
+        let hints = hints_for(Ctx::Archive);
+        assert!(!hints.is_empty());
+        assert!(hints.iter().any(|b| b.label == "open"));
+        assert!(hints.iter().any(|b| b.label == "filter"));
     }
 
     #[test]

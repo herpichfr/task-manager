@@ -1,6 +1,7 @@
 //! Application state: the model the TUI renders and the key dispatcher
 //! mutates.
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -19,8 +20,8 @@ use crate::storage::main_db::MainDb;
 use crate::storage::{StorageError, TaskStore};
 use crate::ui::forms::{Field, FormKind, FormState, TaskDraft};
 use crate::ui::popup::{
-    ConfirmState, DropdownState, DropdownTarget, PassphraseState, Popup, PopupOutcome, PopupValue, SelectItem,
-    TagPickerAction, TagPickerState, TextPromptState,
+    ArchiveBrowserState, ConfirmState, DropdownState, DropdownTarget, FormTagPickerAction, FormTagPickerState,
+    PassphraseState, Popup, PopupOutcome, PopupValue, SelectItem, TagPickerAction, TagPickerState, TextPromptState,
 };
 use crate::ui::theme::{self, Styles};
 use crate::undo::{Command, UndoStack};
@@ -74,6 +75,21 @@ enum PendingPopupAction {
     ConfirmCreateLockedBoard { name: String, passphrase: String },
     /// The delete-board confirmation is open for this board id.
     ConfirmDeleteBoard(BoardId),
+    /// A one-line prompt for a new plain board's name is open (the board
+    /// switcher's `a`, or the `:board` menu's "New board").
+    NewBoardPlain,
+    /// A one-line prompt for a new locked board's name is open (the board
+    /// switcher's `A`, or the `:board` menu's "New locked board"); the
+    /// passphrase entry that follows reuses `NewLockedBoardPass1`.
+    NewBoardLocked,
+    /// A one-line prompt to rename the *current* board is open (the
+    /// `:board` menu's "Rename current board").
+    RenameCurrentBoard,
+    /// The bare `:board` menu is open.
+    BoardMenu,
+    /// A dropdown listing every board is open so the user can pick which
+    /// one to delete (the `:board` menu's "Delete board…").
+    SelectBoardToDelete,
 }
 
 pub struct App {
@@ -117,6 +133,12 @@ pub struct App {
     /// [`App::set_data_dir`] with the same resolved data directory
     /// `main.db` lives in, once at startup.
     data_dir: PathBuf,
+    /// True right after a lone `d` is pressed on the board switcher's
+    /// `Board`-target dropdown, so a second `d` (completing `dd`) deletes
+    /// the highlighted board. Reset on any other key and whenever the
+    /// switcher is (re)opened, so it never survives past the dropdown it
+    /// was set on.
+    board_switcher_pending_d: bool,
 }
 
 /// What an external-editor session is editing.
@@ -130,6 +152,13 @@ pub enum EditTarget {
 
 /// How many rows a half-page scroll moves, absent a known viewport height.
 const HALF_PAGE: u32 = 5;
+
+/// Days after which a Done task is auto-archived: hidden from the board
+/// (and so from the board's `/` search, which only ever sees
+/// `self.columns`) but kept in storage, browsable via `A`. See
+/// `is_archived`.
+const ARCHIVE_AFTER_DAYS: i64 = 5;
+const ARCHIVE_AFTER_SECS: i64 = ARCHIVE_AFTER_DAYS * 86_400;
 
 /// Maps storage-layer errors onto the crate's shared `AppError`. `error.rs`
 /// has no variant of its own for `StorageError`, so this is a plain
@@ -272,6 +301,83 @@ fn advance_in(matches: &[usize], current: usize, dir: i32) -> usize {
     matches[new_pos as usize]
 }
 
+/// Steps `delta` positions through `visible` (ascending raw indices) from
+/// wherever `current` sits among them, clamped to the ends -- plain
+/// movement (`j`/`k`, `gg`/`G`, `^d`/`^u`) never wraps, unlike `advance_in`'s
+/// `n`/`N` jump. When `current` is not itself in `visible` (the search
+/// filter just hid it), lands on the first visible entry in the direction
+/// of travel -- the same "current not a match" convention `advance_in`
+/// uses. `None` when nothing is visible, so callers make no change rather
+/// than landing on a hidden row.
+fn step_visible(visible: &[usize], current: usize, delta: i64) -> Option<usize> {
+    if visible.is_empty() {
+        return None;
+    }
+    let last = visible.len() as i64 - 1;
+    let new_pos = match visible.iter().position(|&i| i == current) {
+        Some(p) => (p as i64 + delta).clamp(0, last),
+        None if delta >= 0 => 0,
+        None => last,
+    };
+    Some(visible[new_pos as usize])
+}
+
+/// Sort key for the ToDo/Doing columns: a task with a deadline sorts by it
+/// ascending -- an overdue deadline is a smaller/more negative timestamp,
+/// so it naturally sorts first, most overdue first -- and a task with no
+/// deadline sorts after every task that has one. `position` tiebreaks
+/// equal deadlines, which is also exactly the pair `reorder_selected`'s
+/// swap-guard (`same_sort_bucket`) allows `J`/`K` to touch.
+fn deadline_sort_key(task: &Task) -> (u8, i64, i64) {
+    match task.deadline {
+        Some(d) => (0, d, task.position),
+        None => (1, 0, task.position),
+    }
+}
+
+/// Sort key for the Done column: descending `completed_at` (most recent
+/// first), `position` tiebreaking equal timestamps. Every Done task is
+/// stamped by `TaskStore::move_task`/`create_task`/`promote_note` (see
+/// `storage::task_store_impl`), so `None` should not occur here in
+/// practice; it sorts last rather than panicking if it ever does.
+fn completed_sort_key(task: &Task) -> (u8, Reverse<i64>, i64) {
+    match task.completed_at {
+        Some(c) => (0, Reverse(c), task.position),
+        None => (1, Reverse(0), task.position),
+    }
+}
+
+/// True once a Done task's `completed_at` is more than `ARCHIVE_AFTER_DAYS`
+/// days in the past. A task with no `completed_at` is never archived.
+fn is_archived(task: &Task, now: i64) -> bool {
+    match task.completed_at {
+        Some(c) => now - c > ARCHIVE_AFTER_SECS,
+        None => false,
+    }
+}
+
+/// Whether `a` and `b` sit in the same automatic-sort bucket for column
+/// `idx`, i.e. whether `J`/`K` may swap them without producing an order
+/// `reload()`'s sort would immediately undo: the Done column compares
+/// `completed_at`, ToDo/Doing compare `deadline`.
+fn same_sort_bucket(idx: usize, a: &Task, b: &Task) -> bool {
+    if Status::ALL[idx] == Status::Done {
+        a.completed_at == b.completed_at
+    } else {
+        a.deadline == b.deadline
+    }
+}
+
+/// The status message `reorder_selected` reports when `J`/`K` is refused
+/// because the two rows do not share a sort bucket.
+fn sort_bucket_mismatch_message(idx: usize) -> String {
+    if Status::ALL[idx] == Status::Done {
+        "Done is sorted by completion time; J/K only swaps tasks completed at the same time".to_string()
+    } else {
+        "column is sorted by deadline; J/K only swaps tasks with the same deadline".to_string()
+    }
+}
+
 /// The active board's store: either the shared main database's rows
 /// (`PlainBoardStore`) or an unlocked `LockedDb`'s own file
 /// (`LockedBoardStore`). See `App::store` for why this is a concrete enum
@@ -392,6 +498,27 @@ impl<'a> TaskStore for ActiveStore<'a> {
     }
 }
 
+/// Upserts each name in `names` (creating any that don't already exist)
+/// and sets exactly that set on `task_id`. Shared by `apply_task_draft`'s
+/// `NewTask` and `EditTask` arms.
+fn apply_draft_tags(store: &ActiveStore<'_>, task_id: TaskId, names: &[String]) -> std::result::Result<(), StorageError> {
+    let mut ids = Vec::with_capacity(names.len());
+    for name in names {
+        ids.push(store.upsert_tag(name, None)?);
+    }
+    store.set_task_tags(task_id, &ids)
+}
+
+/// `SelectItem` ids for the bare `:board` menu's rows
+/// (`App::open_board_menu` / `App::apply_board_menu_selection`).
+const BOARD_MENU_NEW: i64 = 0;
+const BOARD_MENU_NEW_LOCKED: i64 = 1;
+const BOARD_MENU_RENAME: i64 = 2;
+const BOARD_MENU_DELETE: i64 = 3;
+const BOARD_MENU_SWITCH: i64 = 4;
+const BOARD_MENU_LOCK: i64 = 5;
+const BOARD_MENU_INFO: i64 = 6;
+
 impl App {
     /// Builds the app for `board`, loading its tasks and notes from `db`.
     pub fn new(config: Config, db: MainDb, board: Board) -> Result<Self> {
@@ -429,6 +556,7 @@ impl App {
             pending_edit: None,
             unlocked: HashMap::new(),
             data_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            board_switcher_pending_d: false,
         };
         app.reload()?;
         Ok(app)
@@ -482,7 +610,17 @@ impl App {
         }
         let notes = store.list_notes().map_err(storage_err)?;
 
-        for (i, tasks) in all_tasks.into_iter().enumerate() {
+        let now = chrono::Utc::now().timestamp();
+        for (i, mut tasks) in all_tasks.into_iter().enumerate() {
+            if Status::ALL[i] == Status::Done {
+                // Archived rows never reach `self.columns` at all, which is
+                // what keeps the board's `/` search (which only ever walks
+                // `self.columns`) acting on visible tasks alone.
+                tasks.retain(|t| !is_archived(t, now));
+                tasks.sort_by_key(completed_sort_key);
+            } else {
+                tasks.sort_by_key(deadline_sort_key);
+            }
             let old_selected = self.columns[i].selected;
             let selected = if tasks.is_empty() {
                 0
@@ -497,6 +635,7 @@ impl App {
         } else {
             self.notes_selected.min(self.notes.len() - 1)
         };
+        self.clamp_selection_to_visible();
         Ok(())
     }
 
@@ -509,7 +648,9 @@ impl App {
                 Popup::Confirm(_) => Ctx::Confirm,
                 Popup::Passphrase(_) => Ctx::Passphrase,
                 Popup::TagPicker(_) => Ctx::TagPicker,
+                Popup::FormTagPicker(_) => Ctx::FormTagPicker,
                 Popup::TextPrompt(_) => Ctx::TextPrompt,
+                Popup::Archive(_) => Ctx::Archive,
                 Popup::Help => Ctx::Help,
             };
         }
@@ -531,13 +672,28 @@ impl App {
         }
     }
 
+    /// The task at the focused column's current selection -- `None` when
+    /// the column is empty *or* the selected row is hidden by an active
+    /// search filter. Every task-scoped action (edit, delete, open in
+    /// editor, move column, the status/priority/tag dropdowns) goes
+    /// through this, so none of them can act on a row the screen isn't
+    /// showing.
     fn selected_task(&self) -> Option<&Task> {
         let col = &self.columns[self.focused];
-        col.tasks.get(col.selected)
+        let task = col.tasks.get(col.selected)?;
+        match self.search_query() {
+            Some(q) if !task_matches_query(task, &q) => None,
+            _ => Some(task),
+        }
     }
 
+    /// Same rule as `selected_task`, for the notes list.
     fn selected_note(&self) -> Option<&Note> {
-        self.notes.get(self.notes_selected)
+        let note = self.notes.get(self.notes_selected)?;
+        match self.search_query() {
+            Some(q) if !note_matches_query(note, &q) => None,
+            _ => Some(note),
+        }
     }
 
     /// Handles one key press: while any popup is open, keys go to the top
@@ -577,6 +733,76 @@ impl App {
                 self.pending_edit = Some((EditTarget::FormBody, f.body.clone()));
                 return;
             }
+            if f.field == Field::Tags && key.code == KeyCode::Enter && !ctrl {
+                self.open_form_tag_picker();
+                return;
+            }
+        }
+
+        // The board switcher (a `Board`-target dropdown) gets a handful of
+        // extra keys the generic dropdown handler doesn't know about:
+        // `a`/`A` create a board, `dd`/`D` delete the highlighted one. This
+        // is intercepted here rather than in `handle_dropdown_key` because
+        // `dd` needs state (`board_switcher_pending_d`) that only `App`
+        // carries across key presses, and because creating or deleting a
+        // board needs `self.db`, which no popup has a handle to.
+        if let Some(Popup::Dropdown(d)) = self.popups.last() {
+            if d.target == DropdownTarget::Board && !ctrl {
+                let highlighted = d.items.get(d.selected).cloned();
+                match key.code {
+                    KeyCode::Char('d') => {
+                        if self.board_switcher_pending_d {
+                            self.board_switcher_pending_d = false;
+                            if let Some(item) = highlighted {
+                                // Pop the switcher first: `begin_delete_board`
+                                // either pushes a `Confirm` (which must land
+                                // on an empty stack so its own Submit routes
+                                // to `apply_confirmed`, not into a leftover
+                                // `Dropdown` beneath it) or only sets a
+                                // refusal message, closing the switcher
+                                // either way -- the same "closes with a
+                                // message" pattern as `a`/`A`.
+                                self.popups.pop();
+                                self.begin_delete_board(item.id);
+                            }
+                        } else {
+                            self.board_switcher_pending_d = true;
+                        }
+                        return;
+                    }
+                    KeyCode::Char('D') => {
+                        self.board_switcher_pending_d = false;
+                        if let Some(item) = highlighted {
+                            self.popups.pop();
+                            self.begin_delete_board(item.id);
+                        }
+                        return;
+                    }
+                    KeyCode::Char('a') => {
+                        self.board_switcher_pending_d = false;
+                        self.popups.pop();
+                        self.pending_action = Some(PendingPopupAction::NewBoardPlain);
+                        self.popups.push(Popup::TextPrompt(TextPromptState {
+                            prompt: "New board name".to_string(),
+                            input: String::new(),
+                            error: None,
+                        }));
+                        return;
+                    }
+                    KeyCode::Char('A') => {
+                        self.board_switcher_pending_d = false;
+                        self.popups.pop();
+                        self.pending_action = Some(PendingPopupAction::NewBoardLocked);
+                        self.popups.push(Popup::TextPrompt(TextPromptState {
+                            prompt: "New locked board name".to_string(),
+                            input: String::new(),
+                            error: None,
+                        }));
+                        return;
+                    }
+                    _ => self.board_switcher_pending_d = false,
+                }
+            }
         }
 
         let outcome = self
@@ -606,6 +832,8 @@ impl App {
                 }
             }
             PopupOutcome::TagPicker(action) => self.apply_tag_picker_action(action),
+            PopupOutcome::FormTagPicker(action) => self.apply_form_tag_picker_action(action),
+            PopupOutcome::OpenArchivedTask(id) => self.open_archived_task_in_form(id),
         }
     }
 
@@ -680,6 +908,8 @@ impl App {
                 }
             }
             PendingPopupAction::SwitchBoard => self.switch_to_board(item.id),
+            PendingPopupAction::BoardMenu => self.apply_board_menu_selection(item.id),
+            PendingPopupAction::SelectBoardToDelete => self.begin_delete_board(item.id),
             _ => {}
         }
     }
@@ -795,7 +1025,72 @@ impl App {
                     Err(e) => self.message = Some(format!("capture failed: {e}")),
                 }
             }
+            PendingPopupAction::NewBoardPlain => self.begin_plain_board_flow(text),
+            PendingPopupAction::NewBoardLocked => self.begin_locked_board_flow(text),
+            PendingPopupAction::RenameCurrentBoard => {
+                let name = text.trim().to_string();
+                if name.is_empty() {
+                    self.message = Some("usage: :board rename <name>".to_string());
+                    return;
+                }
+                match self.db.rename_board(self.board.id, &name) {
+                    Ok(()) => {
+                        self.board.name = name.clone();
+                        self.message = Some(format!("renamed to \"{name}\""));
+                    }
+                    Err(e) => self.message = Some(format!("rename failed: {e}")),
+                }
+            }
             _ => {}
+        }
+    }
+
+    /// Opens the archive browser: every Done task on the current board
+    /// whose `completed_at` is more than `ARCHIVE_AFTER_DAYS` days old,
+    /// newest completion first. Queried fresh from the store every time it
+    /// opens -- `self.columns` deliberately excludes archived rows, so
+    /// they are not sitting in memory anywhere else -- the same "ask the
+    /// store fresh" pattern `open_tag_picker` uses.
+    fn open_archive_browser(&mut self) {
+        let store = self.store();
+        let now = chrono::Utc::now().timestamp();
+        let mut archived: Vec<Task> = match store.list_tasks(Status::Done) {
+            Ok(tasks) => tasks.into_iter().filter(|t| is_archived(t, now)).collect(),
+            Err(e) => {
+                self.message = Some(format!("failed to load archive: {e}"));
+                return;
+            }
+        };
+        archived.sort_by_key(completed_sort_key);
+        self.popups.push(Popup::Archive(ArchiveBrowserState { tasks: archived, filter: String::new(), selected: 0 }));
+        self.message = None;
+    }
+
+    /// Pops the archive browser and pushes the edit form for `id`, fetched
+    /// fresh from the store so its tags are current. The browser itself is
+    /// replaced on the stack rather than left underneath the form: the
+    /// form's eventual Ctrl-S submit must reach `apply_task_draft` through
+    /// `apply_top_level_value`, and `Popup::receive` only forwards a value
+    /// into a `Form`, so leaving the browser in place would silently
+    /// swallow the save.
+    fn open_archived_task_in_form(&mut self, id: TaskId) {
+        self.popups.pop();
+        let store = self.store();
+        match store.get_task(id) {
+            Ok(task) => {
+                let tags = task.tags.iter().map(|t| t.name.clone()).collect();
+                self.popups.push(Popup::Form(FormState::edit_task(
+                    task.id,
+                    task.title,
+                    task.body,
+                    task.priority,
+                    task.status,
+                    task.start_date,
+                    task.deadline,
+                    tags,
+                )));
+            }
+            Err(_) => self.message = Some("task no longer exists".to_string()),
         }
     }
 
@@ -849,6 +1144,58 @@ impl App {
         }
     }
 
+    /// Opens the form-scoped tag picker for the Tags field of the form
+    /// currently on top of the popup stack: every board tag, with the
+    /// form's own (in-memory, unsaved) `tags` names marked. Toggling
+    /// writes straight into that `Vec<String>` -- nothing reaches the
+    /// store until the form itself is submitted (Ctrl-S).
+    fn open_form_tag_picker(&mut self) {
+        let mut all_tags: Vec<String> = self.store().list_tags().unwrap_or_default().into_iter().map(|t| t.name).collect();
+        let Some(Popup::Form(f)) = self.popups.last() else { return };
+        let applied = f.tags.clone();
+        for name in &applied {
+            if !all_tags.contains(name) {
+                all_tags.push(name.clone());
+            }
+        }
+        self.popups.push(Popup::FormTagPicker(FormTagPickerState { all_tags, applied, selected: 0 }));
+    }
+
+    /// Applies a key press handled inside the form-scoped tag picker.
+    /// `Toggle` mutates the form directly beneath it on the stack and
+    /// leaves the picker open; `New` replaces it with a one-line text
+    /// prompt whose result reaches the form via `Popup::receive`.
+    fn apply_form_tag_picker_action(&mut self, action: FormTagPickerAction) {
+        match action {
+            FormTagPickerAction::Toggle(idx) => {
+                let Some(Popup::FormTagPicker(t)) = self.popups.last() else { return };
+                let Some(name) = t.all_tags.get(idx).cloned() else { return };
+                let len = self.popups.len();
+                if len < 2 {
+                    return;
+                }
+                let Some(Popup::Form(f)) = self.popups.get_mut(len - 2) else { return };
+                if let Some(pos) = f.tags.iter().position(|existing| *existing == name) {
+                    f.tags.remove(pos);
+                } else {
+                    f.tags.push(name);
+                }
+                let applied = f.tags.clone();
+                if let Some(Popup::FormTagPicker(t)) = self.popups.last_mut() {
+                    t.applied = applied;
+                }
+            }
+            FormTagPickerAction::New => {
+                self.popups.pop();
+                self.popups.push(Popup::TextPrompt(TextPromptState {
+                    prompt: "New tag name".to_string(),
+                    input: String::new(),
+                    error: None,
+                }));
+            }
+        }
+    }
+
     /// Toggles `tag_id` on `task_id` (persisted via `set_task_tags`) and,
     /// if the tag picker is still the top popup, refreshes its `applied`
     /// list so the `*` marker updates without closing it.
@@ -887,8 +1234,22 @@ impl App {
                 };
                 match store.create_task(new_task) {
                     Ok(id) => {
+                        // Tags are set by name and are not part of this
+                        // undo command -- the card-level `t` toggle
+                        // (`App::toggle_tag`) is likewise not undoable, so
+                        // this matches existing behaviour rather than
+                        // adding a new undo path just for the form. Done
+                        // before the undo push below, since `store`
+                        // (borrowed from `self`) must not still be alive
+                        // when `self.undo` is mutated.
+                        let tags_result = apply_draft_tags(&store, id, &draft.tags);
                         self.undo.push(Command::CreateTask { id, status });
-                        self.message = Some(format!("created \"{}\"", draft.title));
+                        match tags_result {
+                            Ok(()) => self.message = Some(format!("created \"{}\"", draft.title)),
+                            Err(e) => {
+                                self.message = Some(format!("created \"{}\" (tags failed: {e})", draft.title))
+                            }
+                        }
                         let _ = self.reload();
                         self.select_task(status, id);
                     }
@@ -934,6 +1295,10 @@ impl App {
                 } else {
                     None
                 };
+                // Tags are set by name and are not undoable -- see the
+                // comment in the `NewTask` arm above. Done before the undo
+                // pushes below, for the same borrow-ordering reason.
+                let tags_result = apply_draft_tags(&store, id, &draft.tags);
                 self.undo.push(Command::UpdateTask { id, before, after });
                 if let Some((new_status, after_pos)) = status_move {
                     self.undo.push(Command::MoveTask {
@@ -942,7 +1307,10 @@ impl App {
                         to: (new_status, after_pos),
                     });
                 }
-                self.message = Some(format!("updated \"{}\"", draft.title));
+                match tags_result {
+                    Ok(()) => self.message = Some(format!("updated \"{}\"", draft.title)),
+                    Err(e) => self.message = Some(format!("updated \"{}\" (tags failed: {e})", draft.title)),
+                }
                 let _ = self.reload();
             }
             FormKind::NewNote => {
@@ -1108,17 +1476,31 @@ impl App {
     }
 
     fn reorder_selected(&mut self, delta: i32) {
+        if self.selected_task().is_none() {
+            self.message = Some("no task selected".to_string());
+            return;
+        }
         let idx = self.focused;
         let status = Status::ALL[idx];
+        let visible = self.visible_task_indices(idx);
         let col = &self.columns[idx];
         let sel = col.selected;
-        let len = col.tasks.len() as i64;
-        let target = sel as i64 + i64::from(delta);
-        if col.tasks.is_empty() || target < 0 || target >= len {
+        let Some(pos) = visible.iter().position(|&i| i == sel) else {
+            self.message = Some("no task selected".to_string());
+            return;
+        };
+        let target_pos = pos as i32 + delta;
+        if target_pos < 0 || target_pos as usize >= visible.len() {
             self.message = Some("already at the end".to_string());
             return;
         }
-        let target = target as usize;
+        let target = visible[target_pos as usize];
+
+        if !same_sort_bucket(idx, &col.tasks[sel], &col.tasks[target]) {
+            self.message = Some(sort_bucket_mismatch_message(idx));
+            return;
+        }
+
         let mut ordered: Vec<TaskId> = col.tasks.iter().map(|t| t.id).collect();
         ordered.swap(sel, target);
         let moved_id = col.tasks[sel].id;
@@ -1269,6 +1651,10 @@ impl App {
             self.message = Some("search cleared".to_string());
             return;
         }
+        if cmd == "board" {
+            self.open_board_menu();
+            return;
+        }
         if let Some(rest) = cmd.strip_prefix("board ") {
             self.run_board_command(rest.trim());
             return;
@@ -1300,25 +1686,54 @@ impl App {
         };
         let name = name.to_string();
         let locked = tokens.next().map(|t| t.eq_ignore_ascii_case("locked")).unwrap_or(false);
+        if locked {
+            self.begin_locked_board_flow(name);
+        } else {
+            self.begin_plain_board_flow(name);
+        }
+    }
 
+    /// Shared by `:board new <name>`, the board switcher's `a`, and the
+    /// `:board` menu's "New board": creates a plain board once its name is
+    /// confirmed free.
+    fn begin_plain_board_flow(&mut self, name: String) {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            self.message = Some("board name cannot be empty".to_string());
+            return;
+        }
         if matches!(self.db.get_board_by_name(&name), Ok(Some(_))) {
             self.message = Some(format!("board already exists: {name}"));
             return;
         }
-
-        if locked {
-            self.pending_action = Some(PendingPopupAction::NewLockedBoardPass1 { name: name.clone() });
-            self.popups.push(Popup::Passphrase(PassphraseState {
-                prompt: format!("Passphrase for \"{name}\""),
-                input: String::new(),
-                error: None,
-            }));
-        } else {
-            match self.db.create_board(&name, BoardKind::Plain) {
-                Ok(_) => self.message = Some(format!("created board \"{name}\"")),
-                Err(e) => self.message = Some(format!("create board failed: {e}")),
+        match self.db.create_board(&name, BoardKind::Plain) {
+            Ok(id) => {
+                self.switch_to_board(id);
+                self.message = Some(format!("created board \"{name}\""));
             }
+            Err(e) => self.message = Some(format!("create board failed: {e}")),
         }
+    }
+
+    /// Shared by `:board new <name> locked`, the board switcher's `A`, and
+    /// the `:board` menu's "New locked board": checks the name is free,
+    /// then starts the same two-passphrase-entry flow as before.
+    fn begin_locked_board_flow(&mut self, name: String) {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            self.message = Some("board name cannot be empty".to_string());
+            return;
+        }
+        if matches!(self.db.get_board_by_name(&name), Ok(Some(_))) {
+            self.message = Some(format!("board already exists: {name}"));
+            return;
+        }
+        self.pending_action = Some(PendingPopupAction::NewLockedBoardPass1 { name: name.clone() });
+        self.popups.push(Popup::Passphrase(PassphraseState {
+            prompt: format!("Passphrase for \"{name}\""),
+            input: String::new(),
+            error: None,
+        }));
     }
 
     fn rename_current_board(&mut self, arg: &str) {
@@ -1344,7 +1759,28 @@ impl App {
             self.message = Some(format!("no such board: {arg}"));
             return;
         };
-        self.pending_action = Some(PendingPopupAction::ConfirmDeleteBoard(target.id));
+        self.begin_delete_board(target.id);
+    }
+
+    /// Shared by `:board delete <name>`, the board switcher's `dd`/`D`,
+    /// and the `:board` menu's "Delete board…": refuses to queue a
+    /// delete for the current board or when it is the only board,
+    /// otherwise pushes the same confirmation as before.
+    fn begin_delete_board(&mut self, board_id: BoardId) {
+        let boards = self.db.list_boards().unwrap_or_default();
+        let Some(target) = boards.iter().find(|b| b.id == board_id) else {
+            self.message = Some("board no longer exists".to_string());
+            return;
+        };
+        if boards.len() <= 1 {
+            self.message = Some("cannot delete the only board".to_string());
+            return;
+        }
+        if board_id == self.board.id {
+            self.message = Some("cannot delete the current board; switch away first".to_string());
+            return;
+        }
+        self.pending_action = Some(PendingPopupAction::ConfirmDeleteBoard(board_id));
         self.popups.push(Popup::Confirm(ConfirmState {
             message: format!("delete board \"{}\"? this cannot be undone", target.name),
         }));
@@ -1459,12 +1895,108 @@ impl App {
                 label: if b.kind == BoardKind::Locked { format!("{} [locked]", b.name) } else { b.name.clone() },
             })
             .collect();
+        self.board_switcher_pending_d = false;
         self.pending_action = Some(PendingPopupAction::SwitchBoard);
         self.popups.push(Popup::Dropdown(DropdownState {
-            title: "Boards".to_string(),
+            title: "Boards (a new, A locked, dd/D delete)".to_string(),
             items,
             selected,
             target: DropdownTarget::Board,
+        }));
+    }
+
+    /// Opens the bare `:board` menu: one action per row, `Enter` runs it.
+    fn open_board_menu(&mut self) {
+        let mut items = vec![
+            SelectItem { id: BOARD_MENU_NEW, label: "New board".to_string() },
+            SelectItem { id: BOARD_MENU_NEW_LOCKED, label: "New locked board".to_string() },
+            SelectItem { id: BOARD_MENU_RENAME, label: "Rename current board".to_string() },
+            SelectItem { id: BOARD_MENU_DELETE, label: "Delete board…".to_string() },
+            SelectItem { id: BOARD_MENU_SWITCH, label: "Switch board…".to_string() },
+        ];
+        if self.board.kind == BoardKind::Locked && self.unlocked.contains_key(&self.board.id) {
+            items.push(SelectItem { id: BOARD_MENU_LOCK, label: "Lock current board".to_string() });
+        }
+        items.push(SelectItem {
+            id: BOARD_MENU_INFO,
+            label: format!("Current: \"{}\" [{}]", self.board.name, self.board.kind.as_str()),
+        });
+        self.pending_action = Some(PendingPopupAction::BoardMenu);
+        self.popups.push(Popup::Dropdown(DropdownState {
+            title: "Board menu".to_string(),
+            items,
+            selected: 0,
+            target: DropdownTarget::BoardMenu,
+        }));
+    }
+
+    /// Applies the `id` of whichever row was selected in `open_board_menu`.
+    fn apply_board_menu_selection(&mut self, id: i64) {
+        match id {
+            BOARD_MENU_NEW => {
+                self.pending_action = Some(PendingPopupAction::NewBoardPlain);
+                self.popups.push(Popup::TextPrompt(TextPromptState {
+                    prompt: "New board name".to_string(),
+                    input: String::new(),
+                    error: None,
+                }));
+            }
+            BOARD_MENU_NEW_LOCKED => {
+                self.pending_action = Some(PendingPopupAction::NewBoardLocked);
+                self.popups.push(Popup::TextPrompt(TextPromptState {
+                    prompt: "New locked board name".to_string(),
+                    input: String::new(),
+                    error: None,
+                }));
+            }
+            BOARD_MENU_RENAME => {
+                self.pending_action = Some(PendingPopupAction::RenameCurrentBoard);
+                self.popups.push(Popup::TextPrompt(TextPromptState {
+                    prompt: "Rename current board".to_string(),
+                    input: self.board.name.clone(),
+                    error: None,
+                }));
+            }
+            BOARD_MENU_DELETE => self.open_board_delete_picker(),
+            BOARD_MENU_SWITCH => self.open_board_switcher(),
+            BOARD_MENU_LOCK => self.lock_current_board(),
+            BOARD_MENU_INFO => {
+                self.message =
+                    Some(format!("current board: \"{}\" [{}]", self.board.name, self.board.kind.as_str()));
+            }
+            _ => {}
+        }
+    }
+
+    /// Opens the board-picker dropdown for the `:board` menu's "Delete
+    /// board…": selecting one runs it straight through
+    /// `begin_delete_board`, so the same current/only-board refusal
+    /// applies.
+    fn open_board_delete_picker(&mut self) {
+        let boards = match self.db.list_boards() {
+            Ok(b) => b,
+            Err(e) => {
+                self.message = Some(format!("failed to list boards: {e}"));
+                return;
+            }
+        };
+        if boards.is_empty() {
+            self.message = Some("no boards available".to_string());
+            return;
+        }
+        let items = boards
+            .iter()
+            .map(|b| SelectItem {
+                id: b.id,
+                label: if b.kind == BoardKind::Locked { format!("{} [locked]", b.name) } else { b.name.clone() },
+            })
+            .collect();
+        self.pending_action = Some(PendingPopupAction::SelectBoardToDelete);
+        self.popups.push(Popup::Dropdown(DropdownState {
+            title: "Delete which board?".to_string(),
+            items,
+            selected: 0,
+            target: DropdownTarget::BoardDelete,
         }));
     }
 
@@ -1580,8 +2112,12 @@ impl App {
             }
             KeyCode::Backspace => {
                 self.search.pop();
+                self.clamp_selection_to_visible();
             }
-            KeyCode::Char(c) => self.search.push(c),
+            KeyCode::Char(c) => {
+                self.search.push(c);
+                self.clamp_selection_to_visible();
+            }
             _ => {}
         }
     }
@@ -1665,15 +2201,11 @@ impl App {
                 self.message = None;
             }
             Action::MoveTop => {
-                self.set_selection(0);
+                self.set_selection_edge(false);
                 self.message = None;
             }
             Action::MoveBottom => {
-                let len = match self.pane {
-                    Pane::Board => self.columns[self.focused].tasks.len(),
-                    Pane::Notes => self.notes.len(),
-                };
-                self.set_selection(len.saturating_sub(1));
+                self.set_selection_edge(true);
                 self.message = None;
             }
             Action::HalfPageUp => {
@@ -1743,6 +2275,7 @@ impl App {
             Action::EditSelected => match self.pane {
                 Pane::Board => {
                     if let Some(task) = self.selected_task().cloned() {
+                        let tags = task.tags.iter().map(|t| t.name.clone()).collect();
                         self.popups.push(Popup::Form(FormState::edit_task(
                             task.id,
                             task.title,
@@ -1751,6 +2284,7 @@ impl App {
                             task.status,
                             task.start_date,
                             task.deadline,
+                            tags,
                         )));
                         self.message = None;
                     } else {
@@ -1891,46 +2425,97 @@ impl App {
             Action::Redo => self.do_redo(),
 
             Action::OpenBoardSwitcher => self.open_board_switcher(),
+            Action::OpenArchiveBrowser => {
+                if self.pane == Pane::Board {
+                    self.open_archive_browser();
+                } else {
+                    self.message = Some("archive is only for the board".to_string());
+                }
+            }
         }
     }
 
+    /// Moves the selection `delta` steps, skipping any row hidden by an
+    /// active search filter rather than landing on it. `columns[idx].tasks`
+    /// and `.selected` (and `notes`/`notes_selected`) stay the single
+    /// source of truth throughout -- only the *walk* is filter-aware.
     fn move_selection(&mut self, delta: i64) {
         match self.pane {
             Pane::Board => {
-                let col = &mut self.columns[self.focused];
-                if col.tasks.is_empty() {
-                    return;
+                let idx = self.focused;
+                let visible = self.visible_task_indices(idx);
+                if let Some(new) = step_visible(&visible, self.columns[idx].selected, delta) {
+                    self.columns[idx].selected = new;
                 }
-                let len = col.tasks.len() as i64;
-                let new = (col.selected as i64 + delta).clamp(0, len - 1);
-                col.selected = new as usize;
             }
             Pane::Notes => {
-                if self.notes.is_empty() {
-                    return;
+                let visible = self.visible_note_indices();
+                if let Some(new) = step_visible(&visible, self.notes_selected, delta) {
+                    self.notes_selected = new;
                 }
-                let len = self.notes.len() as i64;
-                let new = (self.notes_selected as i64 + delta).clamp(0, len - 1);
-                self.notes_selected = new as usize;
             }
         }
     }
 
-    fn set_selection(&mut self, idx: usize) {
+    /// Jumps the selection to the first (`last == false`) or last
+    /// (`last == true`) visible row -- `gg`/`G`. A no-op when nothing is
+    /// visible, same as `move_selection`.
+    fn set_selection_edge(&mut self, last: bool) {
         match self.pane {
             Pane::Board => {
-                let col = &mut self.columns[self.focused];
-                if col.tasks.is_empty() {
-                    return;
+                let idx = self.focused;
+                let visible = self.visible_task_indices(idx);
+                let target = if last { visible.last() } else { visible.first() };
+                if let Some(&t) = target {
+                    self.columns[idx].selected = t;
                 }
-                col.selected = idx.min(col.tasks.len() - 1);
             }
             Pane::Notes => {
-                if self.notes.is_empty() {
-                    return;
+                let visible = self.visible_note_indices();
+                let target = if last { visible.last() } else { visible.first() };
+                if let Some(&t) = target {
+                    self.notes_selected = t;
                 }
-                self.notes_selected = idx.min(self.notes.len() - 1);
             }
+        }
+    }
+
+    /// Raw indices, ascending, of tasks in column `idx` visible under the
+    /// active search filter -- every index when no filter is active.
+    fn visible_task_indices(&self, idx: usize) -> Vec<usize> {
+        let tasks = &self.columns[idx].tasks;
+        match self.search_query() {
+            Some(q) => tasks.iter().enumerate().filter(|(_, t)| task_matches_query(t, &q)).map(|(i, _)| i).collect(),
+            None => (0..tasks.len()).collect(),
+        }
+    }
+
+    /// Same as `visible_task_indices`, for the notes list.
+    fn visible_note_indices(&self) -> Vec<usize> {
+        match self.search_query() {
+            Some(q) => self.notes.iter().enumerate().filter(|(_, n)| note_matches_query(n, &q)).map(|(i, _)| i).collect(),
+            None => (0..self.notes.len()).collect(),
+        }
+    }
+
+    /// Restores "selection points at a visible row" after the search
+    /// filter or the underlying data changes -- called after every reload
+    /// and on each character typed into a live search, so a hidden row is
+    /// never left selected long enough for a subsequent action to reach
+    /// it. A column (or the notes list) with no visible rows at all is
+    /// left untouched: there is no visible row to land on, and
+    /// `selected_task`/`selected_note` already treat a selection hidden
+    /// this way as "nothing selected".
+    fn clamp_selection_to_visible(&mut self) {
+        for idx in 0..self.columns.len() {
+            let visible = self.visible_task_indices(idx);
+            if !visible.is_empty() && !visible.contains(&self.columns[idx].selected) {
+                self.columns[idx].selected = visible[0];
+            }
+        }
+        let visible_notes = self.visible_note_indices();
+        if !visible_notes.is_empty() && !visible_notes.contains(&self.notes_selected) {
+            self.notes_selected = visible_notes[0];
         }
     }
 }
@@ -2591,6 +3176,184 @@ mod tests {
         assert_eq!(app.message.as_deref(), Some("no active search"));
     }
 
+    // --- search: movement must skip hidden rows -----------------------------
+
+    fn search_test_app_with_titles(titles: &[&str]) -> App {
+        let db = MainDb::open_in_memory().unwrap();
+        let board_id = db.create_board("test", BoardKind::Plain).unwrap();
+        {
+            let store = db.store_for(board_id);
+            for title in titles {
+                store
+                    .create_task(DomainNewTask {
+                        title: title.to_string(),
+                        body: String::new(),
+                        status: Status::ToDo,
+                        priority: DomainPriority::Normal,
+                        start_date: None,
+                        deadline: None,
+                    })
+                    .unwrap();
+            }
+        }
+        let board = db.get_board_by_name("test").unwrap().unwrap();
+        App::new(Config::default(), db, board).unwrap()
+    }
+
+    /// Drives `/`, types `query`, and presses Enter to commit it -- the real
+    /// key path a live search takes, so these regression tests exercise the
+    /// same per-keystroke clamping normal play does.
+    fn start_committed_search(app: &mut App, query: &str) {
+        app.dispatch(Action::StartSearch);
+        for c in query.chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn j_k_skip_hidden_rows_while_search_is_active() {
+        // "cat", "dog", "cow" -- search "c" hides "dog" (raw index 1).
+        let mut app = search_test_app_with_titles(&["cat", "dog", "cow"]);
+        start_committed_search(&mut app, "c");
+        assert_eq!(app.columns[0].tasks[app.columns[0].selected].title, "cat");
+
+        app.dispatch(Action::MoveDown(1));
+        assert_eq!(app.columns[0].tasks[app.columns[0].selected].title, "cow", "j must skip hidden \"dog\"");
+
+        app.dispatch(Action::MoveUp(1));
+        assert_eq!(app.columns[0].tasks[app.columns[0].selected].title, "cat", "k must skip hidden \"dog\" going back");
+    }
+
+    #[test]
+    fn move_down_with_count_clamps_to_last_visible_row() {
+        // "cat", "dog", "cow", "car" -- search "c" hides only "dog".
+        let mut app = search_test_app_with_titles(&["cat", "dog", "cow", "car"]);
+        start_committed_search(&mut app, "c");
+        app.dispatch(Action::MoveDown(5)); // 5j: more than the 3 visible rows
+        assert_eq!(app.columns[0].tasks[app.columns[0].selected].title, "car", "must clamp to the last visible row");
+    }
+
+    #[test]
+    fn gg_and_shift_g_land_on_first_and_last_visible_row() {
+        let mut app = search_test_app_with_titles(&["cat", "dog", "cow"]);
+        start_committed_search(&mut app, "c");
+        app.dispatch(Action::MoveBottom);
+        assert_eq!(app.columns[0].tasks[app.columns[0].selected].title, "cow");
+        app.dispatch(Action::MoveTop);
+        assert_eq!(app.columns[0].tasks[app.columns[0].selected].title, "cat");
+    }
+
+    #[test]
+    fn half_page_scroll_skips_hidden_rows() {
+        // 6 raw rows, 5 of which match "c"; HALF_PAGE == 5 should land
+        // exactly on the last visible match, not 5 raw rows down.
+        let mut app = search_test_app_with_titles(&["c0", "c1", "xx", "c2", "c3", "c4"]);
+        start_committed_search(&mut app, "c");
+        app.dispatch(Action::HalfPageDown);
+        assert_eq!(app.columns[0].tasks[app.columns[0].selected].title, "c4");
+    }
+
+    #[test]
+    fn h_l_column_switch_lands_on_a_visible_row_in_the_new_column() {
+        let mut app = search_test_app_with_titles(&["cat"]);
+        {
+            let store = app.db.store_for(app.board.id);
+            for title in ["dog", "cow"] {
+                store
+                    .create_task(DomainNewTask {
+                        title: title.to_string(),
+                        body: String::new(),
+                        status: Status::Doing,
+                        priority: DomainPriority::Normal,
+                        start_date: None,
+                        deadline: None,
+                    })
+                    .unwrap();
+            }
+        }
+        app.reload().unwrap();
+        app.columns[1].selected = 0; // "dog" -- about to be hidden by the filter
+        start_committed_search(&mut app, "c");
+        app.dispatch(Action::FocusNextColumn); // ToDo -> Doing
+        assert_eq!(app.focused, 1);
+        assert_eq!(app.columns[1].tasks[app.columns[1].selected].title, "cow", "must not land on hidden \"dog\"");
+    }
+
+    #[test]
+    fn column_with_no_matches_leaves_no_task_selected() {
+        let mut app = search_test_app_with_titles(&["apple", "banana"]);
+        start_committed_search(&mut app, "zzz");
+        assert!(app.search_active);
+        app.dispatch(Action::EditSelected);
+        assert!(app.popups.is_empty(), "must not open an edit form for a hidden/nonexistent row");
+        assert_eq!(app.message.as_deref(), Some("no task selected"));
+    }
+
+    #[test]
+    fn entering_search_hides_the_current_selection_and_snaps_it() {
+        let mut app = search_test_app_with_titles(&["apple", "banana", "cherry"]);
+        app.columns[0].selected = 1; // "banana"
+        app.dispatch(Action::StartSearch);
+        for c in "cherry".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        // Must already be off the now-hidden "banana" while still typing,
+        // before Enter ever commits the filter.
+        assert_eq!(app.columns[0].tasks[app.columns[0].selected].title, "cherry");
+    }
+
+    #[test]
+    fn clearing_search_leaves_a_valid_selection() {
+        let mut app = search_test_app_with_titles(&["apple", "banana", "cherry"]);
+        app.columns[0].selected = 1;
+        start_committed_search(&mut app, "cherry");
+        assert_eq!(app.columns[0].tasks[app.columns[0].selected].title, "cherry");
+
+        app.dispatch(Action::Cancel); // Esc clears the filter
+        assert!(app.search_query().is_none());
+        assert!(app.columns[0].selected < app.columns[0].tasks.len(), "selection must stay in bounds");
+    }
+
+    #[test]
+    fn search_next_after_plain_movement_does_not_double_move() {
+        let mut app = search_test_app_with_titles(&["cat", "dog", "cow", "cup"]);
+        start_committed_search(&mut app, "c");
+        app.dispatch(Action::MoveDown(1)); // cat -> cow, skipping hidden "dog"
+        assert_eq!(app.columns[0].tasks[app.columns[0].selected].title, "cow");
+        app.dispatch(Action::SearchNext); // next match after "cow" is "cup"
+        assert_eq!(app.columns[0].tasks[app.columns[0].selected].title, "cup");
+    }
+
+    #[test]
+    fn reorder_skips_a_hidden_neighbour() {
+        let mut app = search_test_app_with_titles(&["cat", "dog", "cow"]);
+        start_committed_search(&mut app, "c"); // hides "dog"
+        app.dispatch(Action::ReorderTaskDown); // J: swap with the next VISIBLE row, "cow"
+        assert_eq!(app.columns[0].tasks[0].title, "cow");
+        assert_eq!(app.columns[0].tasks[1].title, "dog", "hidden \"dog\" must stay put");
+        assert_eq!(app.columns[0].tasks[2].title, "cat");
+        assert_eq!(app.columns[0].tasks[app.columns[0].selected].title, "cat", "selection follows the moved task");
+    }
+
+    #[test]
+    fn reorder_at_the_visible_edge_reports_message() {
+        let mut app = search_test_app_with_titles(&["cat", "dog", "cow"]);
+        start_committed_search(&mut app, "c"); // "cat" is already first among the visible rows
+        app.dispatch(Action::ReorderTaskUp);
+        assert_eq!(app.message.as_deref(), Some("already at the end"));
+    }
+
+    #[test]
+    fn delete_ignores_a_hidden_selection() {
+        let mut app = search_test_app_with_titles(&["apple", "banana"]);
+        start_committed_search(&mut app, "apple"); // hides "banana", selection snaps to "apple"
+        app.columns[0].selected = 1; // force it back onto the now-hidden "banana"
+        app.dispatch(Action::DeleteSelected);
+        assert_eq!(app.columns[0].tasks.len(), 2, "must not delete a hidden row");
+        assert_eq!(app.message.as_deref(), Some("no task selected"));
+    }
+
     // --- board switching + locked boards -----------------------------------
 
     #[test]
@@ -2711,5 +3474,738 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.board.name, "test");
         assert!(!app.unlocked.contains_key(&app.db.get_board_by_name("vault").unwrap().unwrap().id));
+    }
+
+    // --- Phase: form-scoped tag picker (Bug 1) ------------------------------
+
+    #[test]
+    fn form_new_tag_creation_persists_on_submit_for_a_new_task() {
+        let mut app = test_app_with_tasks();
+        app.dispatch(Action::NewTask);
+        {
+            let f = match app.popups.last_mut() { Some(Popup::Form(f)) => f, _ => unreachable!() };
+            f.title = "tagged task".to_string();
+            f.field = Field::Tags;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.popups.last(), Some(Popup::FormTagPicker(_))));
+
+        {
+            let Some(Popup::FormTagPicker(t)) = app.popups.last_mut() else { unreachable!() };
+            t.selected = t.all_tags.len();
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.popups.last(), Some(Popup::TextPrompt(_))));
+        for c in "urgent".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match app.popups.last() {
+            Some(Popup::Form(f)) => assert_eq!(f.tags, vec!["urgent".to_string()]),
+            other => panic!("expected the form back on top, got {other:?}"),
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(app.popups.is_empty());
+
+        let created = app.columns[0].tasks.iter().find(|t| t.title == "tagged task").expect("task created");
+        assert_eq!(created.tags.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), vec!["urgent"]);
+    }
+
+    #[test]
+    fn form_new_tag_creation_persists_on_submit_for_an_edited_task() {
+        let mut app = test_app_with_tasks();
+        let id = app.columns[0].tasks[0].id;
+        let tag_id = app.store().upsert_tag("home", None).unwrap();
+        app.store().set_task_tags(id, &[tag_id]).unwrap();
+        let _ = app.reload();
+
+        app.dispatch(Action::EditSelected);
+        match app.popups.last() {
+            Some(Popup::Form(f)) => assert_eq!(f.tags, vec!["home".to_string()], "edit form must seed current tags"),
+            other => panic!("expected an edit-task form, got {other:?}"),
+        }
+
+        {
+            let f = match app.popups.last_mut() { Some(Popup::Form(f)) => f, _ => unreachable!() };
+            f.field = Field::Tags;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        {
+            let Some(Popup::FormTagPicker(t)) = app.popups.last_mut() else { unreachable!() };
+            t.selected = t.all_tags.len();
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        for c in "urgent".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(app.popups.is_empty());
+
+        let mut names: Vec<String> = app.store().tags_for_task(id).unwrap().into_iter().map(|t| t.name).collect();
+        names.sort();
+        assert_eq!(names, vec!["home".to_string(), "urgent".to_string()]);
+    }
+
+    #[test]
+    fn toggling_an_existing_tag_in_the_form_adds_and_removes_it() {
+        let mut app = test_app_with_tasks();
+        app.store().upsert_tag("home", None).unwrap();
+        let _ = app.reload();
+
+        app.dispatch(Action::NewTask);
+        {
+            let f = match app.popups.last_mut() { Some(Popup::Form(f)) => f, _ => unreachable!() };
+            f.title = "t".to_string();
+            f.field = Field::Tags;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        {
+            let Some(Popup::FormTagPicker(t)) = app.popups.last() else { panic!("expected form tag picker") };
+            assert_eq!(t.all_tags, vec!["home".to_string()]);
+        }
+
+        // Toggle "home" on: stays open, and the form beneath it picks it up.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.popups.last(), Some(Popup::FormTagPicker(_))), "toggle keeps the picker open");
+        match app.popups.get(app.popups.len() - 2) {
+            Some(Popup::Form(f)) => assert_eq!(f.tags, vec!["home".to_string()]),
+            other => panic!("expected the form beneath the picker, got {other:?}"),
+        }
+
+        // Toggle it back off.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match app.popups.get(app.popups.len() - 2) {
+            Some(Popup::Form(f)) => assert!(f.tags.is_empty()),
+            other => panic!("expected the form beneath the picker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_new_tag_row_label_is_never_stored_as_a_tag() {
+        let mut app = test_app_with_tasks();
+        app.dispatch(Action::NewTask);
+        {
+            let f = match app.popups.last_mut() { Some(Popup::Form(f)) => f, _ => unreachable!() };
+            f.title = "t".to_string();
+            f.field = Field::Tags;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        {
+            let Some(Popup::FormTagPicker(t)) = app.popups.last() else { panic!("expected form tag picker") };
+            assert_eq!(t.selected, 0);
+            assert!(t.all_tags.is_empty(), "no board tags exist yet -- only the \"+ new tag…\" row");
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.popups.last(), Some(Popup::TextPrompt(_))));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        match app.popups.last() {
+            Some(Popup::Form(f)) => assert!(f.tags.is_empty(), "cancelling must not store anything"),
+            other => panic!("expected the form back on top, got {other:?}"),
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(app.popups.is_empty());
+        let created = app.columns[0].tasks.iter().find(|t| t.title == "t").expect("task created");
+        assert!(created.tags.is_empty());
+        assert!(app.store().list_tags().unwrap().iter().all(|t| t.name != "+ new tag…"));
+    }
+
+    #[test]
+    fn newly_typed_tag_appears_in_all_tags_when_picker_reopens() {
+        let mut app = test_app_with_tasks();
+        app.dispatch(Action::NewTask);
+        {
+            let f = match app.popups.last_mut() { Some(Popup::Form(f)) => f, _ => unreachable!() };
+            f.title = "t".to_string();
+            f.field = Field::Tags;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        {
+            let Some(Popup::FormTagPicker(t)) = app.popups.last() else { panic!("expected form tag picker") };
+            assert_eq!(t.selected, 0);
+            assert!(t.all_tags.is_empty());
+        }
+        // Select "+ new tag…" (at index all_tags.len(), which is 0)
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.popups.last(), Some(Popup::TextPrompt(_))));
+        for c in "home".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // Back to form
+        match app.popups.last() {
+            Some(Popup::Form(f)) => assert_eq!(f.tags, vec!["home".to_string()]),
+            other => panic!("expected the form back on top, got {other:?}"),
+        }
+        // Press Enter on Tags field again to reopen the picker
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // Now the picker should have "home" in all_tags and applied
+        {
+            let Some(Popup::FormTagPicker(t)) = app.popups.last() else { panic!("expected form tag picker") };
+            assert!(t.all_tags.contains(&"home".to_string()), "newly typed tag must be in all_tags");
+            assert!(t.applied.contains(&"home".to_string()), "newly typed tag must be in applied");
+        }
+        // Toggle "home" off
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match app.popups.get(app.popups.len() - 2) {
+            Some(Popup::Form(f)) => assert!(f.tags.is_empty(), "toggling must remove the tag from the form"),
+            other => panic!("expected the form beneath the picker, got {other:?}"),
+        }
+    }
+
+    // --- Phase: board switcher add/delete, and the bare `:board` menu (Bug 2) --
+
+    #[test]
+    fn board_switcher_a_creates_a_new_plain_board() {
+        let mut app = test_app_with_tasks();
+        app.dispatch(Action::OpenBoardSwitcher);
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(matches!(app.popups.last(), Some(Popup::TextPrompt(_))));
+        for c in "planning".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.popups.is_empty());
+        let board = app.db.get_board_by_name("planning").unwrap().expect("board created");
+        assert_eq!(board.kind, BoardKind::Plain);
+        assert_eq!(app.board.name, "planning", "must switch to the newly created board");
+    }
+
+    #[test]
+    fn board_switcher_shift_a_starts_a_new_locked_board() {
+        let mut app = test_app_with_tasks();
+        let dir = tempfile::tempdir().unwrap();
+        app.set_data_dir(dir.path().to_path_buf());
+        app.dispatch(Action::OpenBoardSwitcher);
+        app.handle_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE));
+        assert!(matches!(app.popups.last(), Some(Popup::TextPrompt(_))));
+        for c in "vault2".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.popups.last(), Some(Popup::Passphrase(_))), "expected the passphrase flow to start");
+    }
+
+    #[test]
+    fn board_switcher_dd_deletes_the_highlighted_non_current_board() {
+        let mut app = test_app_with_tasks();
+        app.db.create_board("scratch", BoardKind::Plain).unwrap();
+        app.dispatch(Action::OpenBoardSwitcher);
+        {
+            let Some(Popup::Dropdown(d)) = app.popups.last_mut() else { panic!("expected dropdown") };
+            let idx = d.items.iter().position(|i| i.label == "scratch").unwrap();
+            d.selected = idx;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(matches!(app.popups.last(), Some(Popup::Dropdown(_))), "a single 'd' must not delete yet");
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(matches!(app.popups.last(), Some(Popup::Confirm(_))));
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.popups.is_empty());
+        assert!(app.db.get_board_by_name("scratch").unwrap().is_none());
+    }
+
+    #[test]
+    fn board_switcher_shift_d_deletes_the_highlighted_board_immediately() {
+        let mut app = test_app_with_tasks();
+        app.db.create_board("scratch2", BoardKind::Plain).unwrap();
+        app.dispatch(Action::OpenBoardSwitcher);
+        {
+            let Some(Popup::Dropdown(d)) = app.popups.last_mut() else { panic!("expected dropdown") };
+            let idx = d.items.iter().position(|i| i.label == "scratch2").unwrap();
+            d.selected = idx;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE));
+        assert!(matches!(app.popups.last(), Some(Popup::Confirm(_))));
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.popups.is_empty());
+        assert!(app.db.get_board_by_name("scratch2").unwrap().is_none());
+    }
+
+    #[test]
+    fn board_switcher_refuses_to_delete_the_current_board() {
+        let mut app = test_app_with_tasks();
+        app.db.create_board("scratch3", BoardKind::Plain).unwrap();
+        app.dispatch(Action::OpenBoardSwitcher);
+        {
+            let Some(Popup::Dropdown(d)) = app.popups.last_mut() else { panic!("expected dropdown") };
+            let idx = d.items.iter().position(|i| i.label == "test").unwrap();
+            d.selected = idx;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE));
+        assert!(app.popups.is_empty(), "refused, so the switcher closes with a message, same as other actions");
+        assert_eq!(app.message.as_deref(), Some("cannot delete the current board; switch away first"));
+    }
+
+    #[test]
+    fn board_switcher_refuses_to_delete_the_only_board() {
+        let mut app = test_app_with_tasks();
+        app.dispatch(Action::OpenBoardSwitcher);
+        app.handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE));
+        assert!(app.popups.is_empty());
+        assert_eq!(app.message.as_deref(), Some("cannot delete the only board"));
+    }
+
+    #[test]
+    fn bare_board_command_opens_the_menu() {
+        let mut app = test_app_with_tasks();
+        app.mode = Mode::Command;
+        for c in "board".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match app.popups.last() {
+            Some(Popup::Dropdown(d)) => {
+                let labels: Vec<&str> = d.items.iter().map(|i| i.label.as_str()).collect();
+                assert!(labels.contains(&"New board"));
+                assert!(labels.contains(&"New locked board"));
+                assert!(labels.contains(&"Rename current board"));
+                assert!(labels.contains(&"Delete board…"));
+                assert!(labels.contains(&"Switch board…"));
+                assert!(labels.iter().any(|l| l.starts_with("Current: ")));
+                assert!(!labels.contains(&"Lock current board"));
+            }
+            other => panic!("expected the board menu dropdown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn board_menu_new_board_end_to_end() {
+        let mut app = test_app_with_tasks();
+        app.mode = Mode::Command;
+        for c in "board".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        {
+            let Some(Popup::Dropdown(d)) = app.popups.last_mut() else { panic!("expected dropdown") };
+            let idx = d.items.iter().position(|i| i.label == "New board").unwrap();
+            d.selected = idx;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.popups.last(), Some(Popup::TextPrompt(_))));
+        for c in "fromMenu".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.popups.is_empty());
+        assert!(app.db.get_board_by_name("fromMenu").unwrap().is_some());
+        assert_eq!(app.board.name, "fromMenu", "must switch to the newly created board");
+    }
+
+    #[test]
+    fn board_menu_new_locked_board_starts_the_passphrase_flow() {
+        let mut app = test_app_with_tasks();
+        app.mode = Mode::Command;
+        for c in "board".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        {
+            let Some(Popup::Dropdown(d)) = app.popups.last_mut() else { panic!("expected dropdown") };
+            let idx = d.items.iter().position(|i| i.label == "New locked board").unwrap();
+            d.selected = idx;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        for c in "vaultFromMenu".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.popups.last(), Some(Popup::Passphrase(_))));
+    }
+
+    #[test]
+    fn board_menu_rename_current_board_end_to_end() {
+        let mut app = test_app_with_tasks();
+        app.mode = Mode::Command;
+        for c in "board".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        {
+            let Some(Popup::Dropdown(d)) = app.popups.last_mut() else { panic!("expected dropdown") };
+            let idx = d.items.iter().position(|i| i.label == "Rename current board").unwrap();
+            d.selected = idx;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match app.popups.last() {
+            Some(Popup::TextPrompt(p)) => assert_eq!(p.input, "test", "must be prefilled with the current name"),
+            other => panic!("expected a prefilled text prompt, got {other:?}"),
+        }
+        for _ in 0.."test".len() {
+            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        for c in "renamed-board".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.popups.is_empty());
+        assert_eq!(app.board.name, "renamed-board");
+        assert!(app.db.get_board_by_name("renamed-board").unwrap().is_some());
+    }
+
+    #[test]
+    fn board_menu_delete_board_end_to_end() {
+        let mut app = test_app_with_tasks();
+        app.db.create_board("deleteme", BoardKind::Plain).unwrap();
+        app.mode = Mode::Command;
+        for c in "board".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        {
+            let Some(Popup::Dropdown(d)) = app.popups.last_mut() else { panic!("expected dropdown") };
+            let idx = d.items.iter().position(|i| i.label == "Delete board…").unwrap();
+            d.selected = idx;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.popups.last(), Some(Popup::Dropdown(_))), "expected the board-delete picker");
+        {
+            let Some(Popup::Dropdown(d)) = app.popups.last_mut() else { panic!("expected dropdown") };
+            let idx = d.items.iter().position(|i| i.label == "deleteme").unwrap();
+            d.selected = idx;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.popups.last(), Some(Popup::Confirm(_))));
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.popups.is_empty());
+        assert!(app.db.get_board_by_name("deleteme").unwrap().is_none());
+    }
+
+    #[test]
+    fn board_menu_switch_board_opens_the_switcher() {
+        let mut app = test_app_with_tasks();
+        app.db.create_board("other", BoardKind::Plain).unwrap();
+        app.mode = Mode::Command;
+        for c in "board".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        {
+            let Some(Popup::Dropdown(d)) = app.popups.last_mut() else { panic!("expected dropdown") };
+            let idx = d.items.iter().position(|i| i.label == "Switch board…").unwrap();
+            d.selected = idx;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match app.popups.last() {
+            Some(Popup::Dropdown(d)) => assert_eq!(d.target, DropdownTarget::Board),
+            other => panic!("expected the board switcher, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn board_menu_offers_lock_only_for_an_unlocked_locked_board() {
+        let mut app = test_app_with_tasks();
+        let dir = tempfile::tempdir().unwrap();
+        create_locked_board_for_test(&mut app, &dir, "vault", "hunter2");
+        app.dispatch(Action::OpenBoardSwitcher);
+        {
+            let Some(Popup::Dropdown(d)) = app.popups.last_mut() else { panic!("expected dropdown") };
+            let idx = d.items.iter().position(|i| i.label.contains("vault")).unwrap();
+            d.selected = idx;
+        }
+        let outcome = app.popups.last_mut().unwrap().handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.apply_popup_outcome(outcome);
+        if let Some(Popup::Passphrase(p)) = app.popups.last_mut() {
+            p.input = "hunter2".to_string();
+        }
+        let outcome = app.popups.last_mut().unwrap().handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.apply_popup_outcome(outcome);
+        assert_eq!(app.board.name, "vault");
+
+        app.mode = Mode::Command;
+        for c in "board".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let Some(Popup::Dropdown(d)) = app.popups.last() else { panic!("expected dropdown") };
+        assert!(d.items.iter().any(|i| i.label == "Lock current board"));
+    }
+
+    // --- feature: deadline sort in ToDo/Doing, J/K sort-guard -----------
+
+    fn task_with_deadline(id: TaskId, deadline: Option<i64>, position: i64) -> Task {
+        Task {
+            id,
+            board_id: None,
+            title: format!("t{id}"),
+            body: String::new(),
+            status: Status::ToDo,
+            priority: Priority::Normal,
+            position,
+            created_at: 0,
+            updated_at: 0,
+            start_date: None,
+            deadline,
+            completed_at: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn task_with_completed(id: TaskId, completed_at: Option<i64>, position: i64) -> Task {
+        Task { status: Status::Done, completed_at, ..task_with_deadline(id, None, position) }
+    }
+
+    #[test]
+    fn deadline_sort_key_orders_overdue_first_and_none_last() {
+        let day = 86_400;
+        let mut tasks = [
+            task_with_deadline(1, None, 0),
+            task_with_deadline(2, Some(10 * day), 0),
+            task_with_deadline(3, Some(-2 * day), 0),
+            task_with_deadline(4, Some(3 * day), 0),
+        ];
+        tasks.sort_by_key(deadline_sort_key);
+        assert_eq!(tasks.iter().map(|t| t.id).collect::<Vec<_>>(), vec![3, 4, 2, 1]);
+    }
+
+    #[test]
+    fn deadline_sort_key_tiebreaks_equal_deadlines_by_position() {
+        let day = 86_400;
+        let mut tasks = [
+            task_with_deadline(1, Some(5 * day), 1),
+            task_with_deadline(2, Some(5 * day), 0),
+        ];
+        tasks.sort_by_key(deadline_sort_key);
+        assert_eq!(tasks.iter().map(|t| t.id).collect::<Vec<_>>(), vec![2, 1]);
+    }
+
+    #[test]
+    fn completed_sort_key_orders_most_recent_first() {
+        let mut tasks = [
+            task_with_completed(1, Some(100), 0),
+            task_with_completed(2, Some(300), 0),
+            task_with_completed(3, Some(200), 0),
+        ];
+        tasks.sort_by_key(completed_sort_key);
+        assert_eq!(tasks.iter().map(|t| t.id).collect::<Vec<_>>(), vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn is_archived_boundary_is_exactly_five_days() {
+        let now = 10 * ARCHIVE_AFTER_SECS;
+        let exactly_five_days = task_with_completed(1, Some(now - ARCHIVE_AFTER_SECS), 0);
+        assert!(!is_archived(&exactly_five_days, now), "exactly 5 days old must not be archived yet");
+
+        let one_second_past = task_with_completed(2, Some(now - ARCHIVE_AFTER_SECS - 1), 0);
+        assert!(is_archived(&one_second_past, now));
+
+        let never_completed = task_with_completed(3, None, 0);
+        assert!(!is_archived(&never_completed, now));
+    }
+
+    #[test]
+    fn same_sort_bucket_compares_deadline_for_todo_doing_and_completed_at_for_done() {
+        let day = 86_400;
+        let a = task_with_deadline(1, Some(3 * day), 0);
+        let b = task_with_deadline(2, Some(3 * day), 1);
+        let c = task_with_deadline(3, Some(4 * day), 2);
+        assert!(same_sort_bucket(0, &a, &b));
+        assert!(!same_sort_bucket(0, &a, &c));
+
+        let d = task_with_completed(4, Some(500), 0);
+        let e = task_with_completed(5, Some(500), 1);
+        let f = task_with_completed(6, Some(600), 2);
+        assert!(same_sort_bucket(2, &d, &e));
+        assert!(!same_sort_bucket(2, &d, &f));
+    }
+
+    fn new_task_with_deadline(title: &str, deadline: Option<i64>) -> DomainNewTask {
+        DomainNewTask {
+            title: title.to_string(),
+            body: String::new(),
+            status: Status::ToDo,
+            priority: DomainPriority::Normal,
+            start_date: None,
+            deadline,
+        }
+    }
+
+    #[test]
+    fn todo_column_loads_sorted_by_deadline_ascending_none_last() {
+        let db = MainDb::open_in_memory().unwrap();
+        let board_id = db.create_board("test", BoardKind::Plain).unwrap();
+        let day = 86_400;
+        {
+            let store = db.store_for(board_id);
+            // Scrambled creation order on purpose.
+            store.create_task(new_task_with_deadline("none", None)).unwrap();
+            store.create_task(new_task_with_deadline("distant", Some(10 * day))).unwrap();
+            store.create_task(new_task_with_deadline("overdue", Some(-2 * day))).unwrap();
+            store.create_task(new_task_with_deadline("near", Some(3 * day))).unwrap();
+        }
+        let board = db.get_board_by_name("test").unwrap().unwrap();
+        let app = App::new(Config::default(), db, board).unwrap();
+
+        let titles: Vec<&str> = app.columns[0].tasks.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, vec!["overdue", "near", "distant", "none"]);
+    }
+
+    #[test]
+    fn jk_blocked_between_different_deadlines() {
+        let db = MainDb::open_in_memory().unwrap();
+        let board_id = db.create_board("test", BoardKind::Plain).unwrap();
+        let day = 86_400;
+        {
+            let store = db.store_for(board_id);
+            store.create_task(new_task_with_deadline("soon", Some(day))).unwrap();
+            store.create_task(new_task_with_deadline("later", Some(5 * day))).unwrap();
+        }
+        let board = db.get_board_by_name("test").unwrap().unwrap();
+        let mut app = App::new(Config::default(), db, board).unwrap();
+
+        let before: Vec<String> = app.columns[0].tasks.iter().map(|t| t.title.clone()).collect();
+        app.columns[0].selected = 0; // "soon", the earlier deadline
+        app.dispatch(Action::ReorderTaskDown);
+
+        let after: Vec<String> = app.columns[0].tasks.iter().map(|t| t.title.clone()).collect();
+        assert_eq!(before, after, "different-deadline rows must not swap");
+        assert!(app.message.as_deref().unwrap_or("").contains("sorted by deadline"), "{:?}", app.message);
+    }
+
+    #[test]
+    fn jk_allowed_between_equal_deadlines() {
+        let db = MainDb::open_in_memory().unwrap();
+        let board_id = db.create_board("test", BoardKind::Plain).unwrap();
+        let day = 86_400;
+        {
+            let store = db.store_for(board_id);
+            store.create_task(new_task_with_deadline("a", Some(2 * day))).unwrap();
+            store.create_task(new_task_with_deadline("b", Some(2 * day))).unwrap();
+        }
+        let board = db.get_board_by_name("test").unwrap().unwrap();
+        let mut app = App::new(Config::default(), db, board).unwrap();
+        assert_eq!(app.columns[0].tasks[0].title, "a");
+
+        app.columns[0].selected = 0;
+        app.dispatch(Action::ReorderTaskDown);
+
+        assert_eq!(app.columns[0].tasks[0].title, "b", "same-deadline rows may swap");
+        assert_eq!(app.columns[0].tasks[1].title, "a");
+    }
+
+    #[test]
+    fn jk_allowed_between_two_tasks_with_no_deadline() {
+        let mut app = test_app_with_tasks(); // "a", "b", "c", all with no deadline
+        app.columns[0].selected = 0;
+        app.dispatch(Action::ReorderTaskDown);
+        assert_eq!(app.columns[0].tasks[0].title, "b");
+        assert_eq!(app.columns[0].tasks[1].title, "a");
+    }
+
+    // --- feature: completed_at set/cleared on every route into/out of Done --
+
+    fn task_completed_at(app: &App, id: TaskId) -> Option<i64> {
+        app.db.store_for(app.board.id).get_task(id).unwrap().completed_at
+    }
+
+    /// Focuses whichever column `id` is currently in and selects it there,
+    /// so a follow-up `MoveTaskNextColumn`/`MoveTaskPrevColumn` acts on the
+    /// same task rather than on whatever else now sits at the old
+    /// selection index.
+    fn focus_task(app: &mut App, id: TaskId) {
+        for (idx, col) in app.columns.iter().enumerate() {
+            if let Some(pos) = col.tasks.iter().position(|t| t.id == id) {
+                app.focused = idx;
+                app.columns[idx].selected = pos;
+                return;
+            }
+        }
+        panic!("task {id} not found in any column");
+    }
+
+    #[test]
+    fn h_l_route_sets_and_clears_completed_at() {
+        let mut app = test_app_with_tasks();
+        let id = app.columns[0].tasks[0].id;
+        focus_task(&mut app, id);
+
+        app.dispatch(Action::MoveTaskNextColumn); // ToDo -> Doing
+        assert_eq!(task_completed_at(&app, id), None);
+        focus_task(&mut app, id);
+        app.dispatch(Action::MoveTaskNextColumn); // Doing -> Done
+        assert!(task_completed_at(&app, id).is_some());
+
+        focus_task(&mut app, id);
+        app.dispatch(Action::MoveTaskPrevColumn); // Done -> Doing
+        assert_eq!(task_completed_at(&app, id), None);
+    }
+
+    #[test]
+    fn dropdown_route_sets_completed_at() {
+        let mut app = test_app_with_tasks();
+        let id = app.columns[0].tasks[0].id;
+        app.dispatch(Action::OpenColumnDropdown);
+        if let Some(Popup::Dropdown(d)) = app.popups.last_mut() {
+            let idx = d.items.iter().position(|i| i.label == "Done").unwrap();
+            d.selected = idx;
+        }
+        let outcome = app.popups.last_mut().unwrap().handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.apply_popup_outcome(outcome);
+        assert!(task_completed_at(&app, id).is_some());
+    }
+
+    #[test]
+    fn edit_form_status_change_route_sets_completed_at() {
+        let mut app = test_app_with_tasks();
+        let id = app.columns[0].tasks[0].id;
+        app.dispatch(Action::EditSelected);
+        if let Some(Popup::Form(f)) = app.popups.last_mut() {
+            f.status = Status::Done;
+        }
+        let outcome = app
+            .popups
+            .last_mut()
+            .unwrap()
+            .handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        app.apply_popup_outcome(outcome);
+        assert!(task_completed_at(&app, id).is_some());
+    }
+
+    #[test]
+    fn undo_redo_of_a_move_to_done_toggles_completed_at() {
+        let mut app = test_app_with_tasks();
+        let id = app.columns[0].tasks[0].id;
+        focus_task(&mut app, id);
+        app.dispatch(Action::MoveTaskNextColumn);
+        focus_task(&mut app, id);
+        app.dispatch(Action::MoveTaskNextColumn);
+        assert!(task_completed_at(&app, id).is_some());
+
+        app.dispatch(Action::Undo);
+        assert_eq!(task_completed_at(&app, id), None);
+
+        app.dispatch(Action::Redo);
+        assert!(task_completed_at(&app, id).is_some());
+    }
+
+    // --- feature: auto-archive & the archive browser ----------------------
+
+    #[test]
+    fn freshly_completed_done_task_stays_on_the_board() {
+        let mut app = test_app_with_tasks();
+        let id = app.columns[0].tasks[0].id;
+        focus_task(&mut app, id);
+        app.dispatch(Action::MoveTaskNextColumn);
+        focus_task(&mut app, id);
+        app.dispatch(Action::MoveTaskNextColumn);
+        assert_eq!(app.columns[2].tasks.len(), 1);
+    }
+
+    #[test]
+    fn shift_a_opens_the_archive_browser_popup() {
+        let mut app = test_app_with_tasks();
+        app.dispatch(Action::OpenArchiveBrowser);
+        assert!(matches!(app.popups.last(), Some(Popup::Archive(_))));
+    }
+
+    #[test]
+    fn archive_browser_refused_from_the_notes_pane() {
+        let mut app = test_app_with_tasks();
+        app.pane = Pane::Notes;
+        app.dispatch(Action::OpenArchiveBrowser);
+        assert!(app.popups.is_empty());
+        assert_eq!(app.message.as_deref(), Some("archive is only for the board"));
     }
 }

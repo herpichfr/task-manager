@@ -5,8 +5,8 @@ SQLite-backed, with password-protected boards whose database file is itself
 encrypted.
 
 **Status**: all 14 original requirements plus a round of user feedback are done
-and verified. 258 tests pass, `cargo clippy --all-targets -- -D warnings` is
-clean, ~8,900 lines. Approved plan: `~/.claude/plans/silly-tinkering-perlis.md`.
+and verified. 350 tests pass, `cargo clippy --all-targets -- -D warnings` is
+clean, ~13,000 lines. Approved plan: `~/.claude/plans/silly-tinkering-perlis.md`.
 
 Installed binary: `~/.local/bin/tsk` (8 MB, release, stripped). Rebuild and
 reinstall with `./install.sh`.
@@ -22,7 +22,7 @@ reinstall with `./install.sh`.
 
 export PATH="$HOME/.cargo/bin:$PATH"     # rustup toolchain, rustc 1.98.1
 cargo build                              # or --release
-cargo test                               # 258 tests, all headless
+cargo test                               # 350 tests, all headless
 cargo clippy --all-targets -- -D warnings
 ./target/debug/tsk                       # needs a real TTY
 TSK_DB_DIR=/tmp/scratch ./target/debug/tsk   # isolated database
@@ -161,9 +161,11 @@ previously world-readable at the mercy of the umask. Tests assert both.
 `h/l` column · `j/k` move · `gg`/`G` · `^d`/`^u` · `Tab` pane · `a`/`i` new ·
 `e` edit · `o` body in nvim · `H`/`L` move column · `J`/`K` reorder · `m`/`p`/`t`
 dropdowns · `dd` delete · `c` capture note · `N` notes pane · `gp` promote ·
-`b` or `<Space>b` boards · `S` status dropdown · `u`/`^r` undo/redo ·
+`b` or `<Space>b` boards (`a`/`A` new plain/locked board, `dd`/`D` delete
+highlighted) · `S` status dropdown · `A` archive browser · `u`/`^r` undo/redo ·
 `/` search (`n`/`N` next/prev match, `Esc` or `:nohl` clears) · `:` command ·
-`?` help · `ZZ` quit. In the notes pane `a`/`e`/`dd` act on notes. Commands: `:board new <name> [locked]`,
+`?` help · `ZZ` quit. In the notes pane `a`/`e`/`dd` act on notes. Commands: `:board` (opens an action
+menu: new/new locked/rename current/delete…/switch…/lock), `:board new <name> [locked]`,
 `:board rename <name>`, `:board delete <name>`, `:lock`, `:q`.
 
 ---
@@ -198,21 +200,87 @@ xterm colour cube was evenly spaced. It is not — the levels are
 quantised to 214. `nearest_ansi256` now snaps to the real levels and also
 considers the 24-step greyscale ramp.
 
+## Column ordering, archive and card preview (user-specified)
+
+- **ToDo and Doing are sorted automatically by deadline**, least time left
+  first, so overdue tasks sit on top (most overdue first); tasks with no
+  deadline go last; `position` breaks ties. Sorting lives in `App::reload()`
+  (`deadline_sort_key`), not in SQL — every mutating action already goes
+  through `reload()`, so selection, search clamping and undo needed no change.
+- **Done is sorted by `completed_at`, newest first** (`completed_sort_key`).
+  `completed_at` is stamped in `move_task` (the single choke point for H/L, the
+  `m`/`S` dropdown, the edit form's status change and undo/redo), plus
+  `create_task`/`promote_note` when a task is born in Done. Leaving Done clears
+  it. Undoing a *delete* of a Done task restamps it with the current time rather
+  than restoring the original — same as `created_at` on delete-undo.
+- **`J`/`K` only swap tasks with the same sort key** (same deadline, or both
+  none; in Done, the same `completed_at`). Otherwise they refuse with a status
+  message, so manual reorder can never fight the automatic sort.
+- **Auto-archive**: a Done task whose `completed_at` is more than
+  `ARCHIVE_AFTER_DAYS` (= 5, in `app.rs`) days old is filtered out in
+  `reload()` and never enters `self.columns`, so `/` search only sees board
+  tasks. It stays in the database.
+- **Archive browser: `A`**. Lists the board's archived tasks newest first with
+  completion date; typing filters live over title, body and tag names; `j`/`k`
+  and arrows move (so `j`/`k` cannot be typed into the filter — revisit if that
+  bites); Enter replaces the browser with the edit form, where changing status
+  brings the task back to the board; Esc closes.
+- **Selected-card preview**: the highlighted card in the focused column expands
+  by up to 3 lines of body text, whitespace collapsed, word-wrapped to the
+  column's inner width (wider column → more words), with `…` on truncation. No
+  expansion for an empty body. `ui/board.rs` had no viewport logic before;
+  `scroll_window` now keeps the selected (possibly taller) card on screen.
+- **Help (`?`) fixed**: it used to dump every binding of every context into a
+  fixed 12-row box, cutting off everything after `J/K`. It now lists the
+  board, notes-pane and global bindings, sized to fit, flowing into extra
+  columns on short terminals.
+
+Verified in a real terminal (tmux, 140×30 and 140×16) against a seeded scratch
+DB: sort order, overdue on top, Done order, 6- and 10-day-old tasks hidden and
+listed under `A`, body filtering, Enter → edit form, preview wrapping and `…`,
+and the help popup showing `A`.
+
+---
+
 ## Open work, roughly in priority order
 
 1. **All-locked boards cannot start.** `App::ensure_startable` refuses to open
    directly onto a locked board because no passphrase prompt exists before the
    TUI loop begins. If every board is locked, the CLI will not start. Fix by
    prompting at startup.
-2. **`j`/`k` can land on a hidden row while a search filter is active.** Search
-   hides non-matching rows at render time, but `col.selected` still indexes the
-   full list; only `n`/`N` walk the matching subset. Either filter the backing
-   list or make plain movement skip hidden rows.
+2. ~~**`j`/`k` can land on a hidden row while a search filter is active.**~~
+   **DONE.** Selection movement is filter-aware rather than the backing list
+   being filtered: `move_selection`, `gg`/`G` and `^d`/`^u` walk a per-call
+   list of visible raw indices through `step_visible` (clamped, non-wrapping),
+   and `J`/`K` swap with the nearest *visible* neighbour, leaving hidden rows
+   undisturbed between the pair. `columns[idx].tasks`/`.selected` stay the
+   single source of truth — only the *walk* is filtered — so undo/redo, board
+   switching, reload and `ui/board.rs`'s render-time filter all needed no
+   change. One invariant carries it: while a filter is active, every column's
+   `selected` points at a visible row or that column has nothing visible. It
+   is held by `clamp_selection_to_visible`, called from exactly two places —
+   the end of `reload()` (which every mutating action already goes through)
+   and every keystroke in `handle_search_key`. `search_query` is already
+   `Some` while `mode == Mode::Search`, so clamping engages on the first
+   character typed, not at Enter. Because the invariant holds continuously,
+   `h`/`l` needed no code of its own. `selected_task`/`selected_note` return
+   `None` for a hidden row, so every task-scoped action (edit, delete, open in
+   editor, move column, the `m`/`p`/`t` dropdowns, promote) refuses to act on
+   one. A column with no matches keeps its index and reports "no task
+   selected". `n`/`N` are untouched. 12 regression tests; suite went 258 → 270.
+   Verified by unit tests driving real `KeyEvent`s, not yet under a pty.
 3. **A status-changing edit takes two undos.** Editing a task and changing its
    status in the same form pushes two undo commands (the field update, and the
    `move_task` that keeps column positions dense). Collapse them into one.
-4. **The form's own Tags field is still local-only.** Card-level tagging (`t`)
-   persists correctly; the Tags row inside the task form does not write through.
+4. ~~**The form's own Tags field is still local-only.**~~ **DONE.** Enter on
+   the Tags field opens a form-scoped tag picker (`Popup::FormTagPicker`):
+   every board tag, toggleable in place against the form's own in-memory
+   `Vec<String>` of names, plus "+ new tag…" (a `TextPrompt` whose result
+   flows back into the form via `Popup::receive`, since the form stays on
+   the popup stack underneath it). Nothing reaches the store until the form
+   is submitted (Ctrl-S), which upserts each name and calls
+   `set_task_tags`. The edit form is seeded with the task's current tags.
+   Not undoable, the same as the card-level `t` toggle.
 5. **README + packaging**: `cargo-deb` for Debian. `install.sh` covers
    source installs already.
 6. **Linux Mint MATE is unverified.** Plan is a static
@@ -226,15 +294,22 @@ considers the 24-step greyscale ramp.
    sequence is still applied in the tmux path, which may be unnecessary.
 8. Undo/redo is in-memory per session and does not survive a restart. Normal for
    a vim-style tool; confirm with the user if persistence is wanted.
+9. **Archive browser filter cannot contain `j`/`k`** because those keys
+   navigate. If the user wants to search for words with those letters, switch
+   navigation to `Ctrl-n`/`Ctrl-p` + arrows and let every printable char filter.
 
 ---
 
 ## Schema versions
 
-`schema_version` is at **2**. Version 1 is the original tables; version 2 adds
-`tasks.start_date` and `tasks.deadline` (both nullable unix seconds) to the main
-and locked-board schemas. **Never edit an existing migration** — append a new
+`schema_version` is at **3**. Version 1 is the original tables; version 2 adds
+`tasks.start_date` and `tasks.deadline` (both nullable unix seconds); version 3
+adds `tasks.completed_at` (nullable unix seconds) and backfills it with
+`updated_at` for rows already in Done. All three apply to both the main and the
+locked-board schemas. **Never edit an existing migration** — append a new
 version. A real v1 database was upgraded in place and verified to keep its rows.
+Note that the v3 backfill means Done tasks untouched for more than 5 days drop
+off the board into the archive on first launch after upgrading — expected.
 
 ## Testing notes for whoever picks this up
 

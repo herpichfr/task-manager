@@ -375,4 +375,24 @@ mod tests {
         let db = LockedDb::create(&path, &key_hex, "vault").unwrap();
         shared_tests::tags_load_with_list_tasks_for_many_tasks(&db.store());
     }
+
+    #[test]
+    fn move_task_sets_and_clears_completed_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.db");
+        let salt = crypto::generate_salt();
+        let key_hex = key_hex_for("hunter2", &salt);
+        let db = LockedDb::create(&path, &key_hex, "vault").unwrap();
+        shared_tests::move_task_sets_and_clears_completed_at(&db.store());
+    }
+
+    #[test]
+    fn create_task_directly_in_done_sets_completed_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.db");
+        let salt = crypto::generate_salt();
+        let key_hex = key_hex_for("hunter2", &salt);
+        let db = LockedDb::create(&path, &key_hex, "vault").unwrap();
+        shared_tests::create_task_directly_in_done_sets_completed_at(&db.store());
+    }
 }

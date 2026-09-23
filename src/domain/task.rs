@@ -103,6 +103,11 @@ pub struct Task {
     pub start_date: Option<i64>,
     /// Unix seconds, `None` = unset.
     pub deadline: Option<i64>,
+    /// Unix seconds the task most recently entered `Status::Done`, `None`
+    /// otherwise. Set and cleared exclusively by the storage layer
+    /// (`TaskStore::move_task`/`create_task`/`promote_note`), never by a
+    /// caller-supplied patch -- see `storage::task_store_impl`.
+    pub completed_at: Option<i64>,
     pub tags: Vec<Tag>,
 }
 

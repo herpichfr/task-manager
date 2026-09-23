@@ -10,7 +10,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph};
 use ratatui::Frame;
 
-use crate::domain::task::{Status, Tag, TagId, TaskId};
+use crate::app::task_matches_query;
+use crate::domain::dates;
+use crate::domain::task::{Status, Tag, TagId, Task, TaskId};
 use crate::ui::forms::{Field, FormState, TaskDraft};
 use crate::ui::theme::Styles;
 
@@ -21,7 +23,9 @@ pub enum Popup {
     Confirm(ConfirmState),
     Passphrase(PassphraseState),
     TagPicker(TagPickerState),
+    FormTagPicker(FormTagPickerState),
     TextPrompt(TextPromptState),
+    Archive(ArchiveBrowserState),
     Help,
 }
 
@@ -42,6 +46,16 @@ pub enum PopupOutcome {
     /// tag picker off the stack (a `Toggle`); the caller decides whether
     /// `New`/`Rename`/`Delete` replace it with a text prompt or confirm.
     TagPicker(TagPickerAction),
+    /// The form-scoped tag picker's in-place action -- see
+    /// `FormTagPickerAction`.
+    FormTagPicker(FormTagPickerAction),
+    /// The archive browser's Enter on task `TaskId`: the caller (`App`)
+    /// pops the browser and pushes the edit form for it, fetched fresh
+    /// from the store so its tags are current -- the browser's own key
+    /// handler has no access to the store, the same reason
+    /// `TagPickerAction`/`FormTagPickerAction` hand their New/Rename/
+    /// Delete back to `App` rather than acting in place.
+    OpenArchivedTask(TaskId),
 }
 
 #[derive(Debug, Clone)]
@@ -75,8 +89,9 @@ pub struct SelectItem {
 pub enum DropdownTarget {
     Column,
     Priority,
-    Tag,
     Board,
+    BoardMenu,
+    BoardDelete,
     Status,
 }
 
@@ -130,6 +145,60 @@ pub enum TagPickerAction {
     Delete(TagId),
 }
 
+/// The board's tags for the currently open task/note form's Tags field:
+/// navigable as name rows plus a trailing "+ new tag…" row, the same
+/// feel as `TagPickerState` but scoped to the form's own in-memory
+/// `Vec<String>` of tag names rather than a real task's stored tags --
+/// nothing here is persisted to the store until the form itself is
+/// submitted. `applied` is the subset of `all_tags` currently in the
+/// form's `tags`, shown with a `*` marker.
+#[derive(Debug, Clone)]
+pub struct FormTagPickerState {
+    pub all_tags: Vec<String>,
+    pub applied: Vec<String>,
+    pub selected: usize,
+}
+
+/// What a key press on the form-scoped tag picker asks `App` to do.
+/// `Toggle` is handled in place, writing straight into the form beneath it
+/// on the stack; `New` asks `App` to replace this picker with a one-line
+/// text prompt, whose submitted name flows back into the form via
+/// `Popup::receive` (the form is still underneath it, same as the
+/// Status/Priority dropdowns).
+#[derive(Debug, Clone, Copy)]
+pub enum FormTagPickerAction {
+    Toggle(usize),
+    New,
+}
+
+/// The current board's archived (auto-hidden Done) tasks, loaded once when
+/// the browser opens (`App::open_archive_browser`), already newest-
+/// completion-first, and filtered live as the user types. `j`/`k`/arrows
+/// are reserved for navigation -- the same trade-off every other list
+/// popup in this module makes -- so any other character extends `filter`
+/// instead. `selected` indexes into `visible()`, the current filtered
+/// view, not into `tasks` directly; it is reset to 0 whenever the filter
+/// text changes, since the filtered set's shape just changed under it.
+#[derive(Debug, Clone)]
+pub struct ArchiveBrowserState {
+    pub tasks: Vec<Task>,
+    pub filter: String,
+    pub selected: usize,
+}
+
+impl ArchiveBrowserState {
+    /// The tasks currently matching `filter` (case-insensitive substring
+    /// over title, body, and tag names, via the same `task_matches_query`
+    /// the board's own `/` search uses), in `tasks`' order.
+    pub fn visible(&self) -> Vec<&Task> {
+        if self.filter.is_empty() {
+            self.tasks.iter().collect()
+        } else {
+            self.tasks.iter().filter(|t| task_matches_query(t, &self.filter)).collect()
+        }
+    }
+}
+
 impl Popup {
     pub fn handle_key(&mut self, key: KeyEvent) -> PopupOutcome {
         match self {
@@ -138,7 +207,9 @@ impl Popup {
             Popup::Confirm(_) => handle_confirm_key(key),
             Popup::Passphrase(p) => handle_passphrase_key(p, key),
             Popup::TagPicker(t) => handle_tag_picker_key(t, key),
+            Popup::FormTagPicker(t) => handle_form_tag_picker_key(t, key),
             Popup::TextPrompt(p) => handle_text_prompt_key(p, key),
+            Popup::Archive(t) => handle_archive_key(t, key),
             Popup::Help => PopupOutcome::Close,
         }
     }
@@ -216,6 +287,20 @@ fn handle_text_prompt_key(p: &mut TextPromptState, key: KeyEvent) -> PopupOutcom
     if key.code == KeyCode::Esc || (ctrl && key.code == KeyCode::Char('c')) {
         return PopupOutcome::Close;
     }
+    // Ctrl-U clears the line, Ctrl-W deletes the previous word (readline convention).
+    if ctrl {
+        match key.code {
+            KeyCode::Char('u') => p.input.clear(),
+            KeyCode::Char('w') => {
+                let trimmed = p.input.trim_end_matches(' ').len();
+                let cut = p.input[..trimmed].rfind(' ').map_or(0, |i| i + 1);
+                p.input.truncate(cut);
+            }
+            _ => return PopupOutcome::Consumed,
+        }
+        p.error = None;
+        return PopupOutcome::Consumed;
+    }
     match key.code {
         KeyCode::Enter => return PopupOutcome::Submit(PopupValue::Text(std::mem::take(&mut p.input))),
         KeyCode::Backspace => {
@@ -265,6 +350,76 @@ fn handle_tag_picker_key(t: &mut TagPickerState, key: KeyEvent) -> PopupOutcome 
     PopupOutcome::Consumed
 }
 
+/// `j/k`/`gg`/`G` navigate the tag-name rows plus the trailing "+ new
+/// tag…" row; Enter toggles a row's membership in the form's own
+/// `tags` (or, on the last row, starts the new-tag flow). No rename/delete:
+/// those are the card-level picker's job, not the form's.
+fn handle_form_tag_picker_key(t: &mut FormTagPickerState, key: KeyEvent) -> PopupOutcome {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if key.code == KeyCode::Esc || (ctrl && key.code == KeyCode::Char('c')) {
+        return PopupOutcome::Close;
+    }
+    let len = t.all_tags.len() + 1;
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => t.selected = (t.selected + 1) % len,
+        KeyCode::Char('k') | KeyCode::Up => {
+            t.selected = if t.selected == 0 { len - 1 } else { t.selected - 1 };
+        }
+        KeyCode::Char('g') => t.selected = 0,
+        KeyCode::Char('G') => t.selected = len - 1,
+        KeyCode::Enter => {
+            if t.selected >= t.all_tags.len() {
+                return PopupOutcome::FormTagPicker(FormTagPickerAction::New);
+            }
+            return PopupOutcome::FormTagPicker(FormTagPickerAction::Toggle(t.selected));
+        }
+        _ => {}
+    }
+    PopupOutcome::Consumed
+}
+
+/// `j`/`k`/arrows navigate the currently filtered list (wrapping, same as
+/// every other popup here); any other character is appended to the filter
+/// instead, so `j`/`k`/`g`/`G` cannot themselves be typed into it. Backspace
+/// edits the filter. Enter opens the highlighted task -- see
+/// `PopupOutcome::OpenArchivedTask`. The filter changing always resets
+/// `selected` to 0, since the filtered set's shape just changed under it.
+fn handle_archive_key(t: &mut ArchiveBrowserState, key: KeyEvent) -> PopupOutcome {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if key.code == KeyCode::Esc || (ctrl && key.code == KeyCode::Char('c')) {
+        return PopupOutcome::Close;
+    }
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            let len = t.visible().len();
+            if len > 0 {
+                t.selected = (t.selected + 1) % len;
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            let len = t.visible().len();
+            if len > 0 {
+                t.selected = if t.selected == 0 { len - 1 } else { t.selected - 1 };
+            }
+        }
+        KeyCode::Backspace => {
+            t.filter.pop();
+            t.selected = 0;
+        }
+        KeyCode::Enter => {
+            if let Some(task) = t.visible().get(t.selected) {
+                return PopupOutcome::OpenArchivedTask(task.id);
+            }
+        }
+        KeyCode::Char(c) if !ctrl => {
+            t.filter.push(c);
+            t.selected = 0;
+        }
+        _ => {}
+    }
+    PopupOutcome::Consumed
+}
+
 /// Returns a `width` x `height` rectangle centred within `area`, clamped so
 /// it always fits inside `area` even when `area` is smaller than the
 /// requested size.
@@ -297,7 +452,9 @@ fn render_one(frame: &mut Frame, area: Rect, popup: &Popup, styles: &Styles) {
         Popup::Confirm(c) => render_confirm(frame, area, c, styles),
         Popup::Passphrase(p) => render_passphrase(frame, area, p, styles),
         Popup::TagPicker(t) => render_tag_picker(frame, area, t, styles),
+        Popup::FormTagPicker(t) => render_form_tag_picker(frame, area, t, styles),
         Popup::TextPrompt(p) => render_text_prompt(frame, area, p, styles),
+        Popup::Archive(t) => render_archive_browser(frame, area, t, styles),
         Popup::Help => render_help(frame, area, styles),
     }
 }
@@ -475,11 +632,13 @@ fn render_tag_picker(frame: &mut Frame, area: Rect, t: &TagPickerState, styles: 
         .collect();
     labels.push("  + new tag…".to_string());
 
+    let title = " Tags (Enter toggle, r rename, d delete) ";
     let width = labels
         .iter()
         .map(|l| l.chars().count() as u16 + 4)
         .max()
         .unwrap_or(10)
+        .max((title.chars().count() as u16) + 2)
         .max(20);
     let height = (labels.len() as u16 + 2).max(3);
     let rect = centered_rect(width, height, area);
@@ -494,21 +653,115 @@ fn render_tag_picker(frame: &mut Frame, area: Rect, t: &TagPickerState, styles: 
         .collect();
 
     let block = Block::bordered()
-        .title(Line::from(" Tags (Enter toggle, r rename, d delete) "))
+        .title(Line::from(title))
         .border_style(styles.border);
     frame.render_widget(Clear, rect);
     frame.render_widget(List::new(items).block(block), rect);
 }
 
+fn render_form_tag_picker(frame: &mut Frame, area: Rect, t: &FormTagPickerState, styles: &Styles) {
+    let mut labels: Vec<String> = t
+        .all_tags
+        .iter()
+        .map(|name| {
+            let marker = if t.applied.contains(name) { "* " } else { "  " };
+            format!("{marker}{name}")
+        })
+        .collect();
+    labels.push("  + new tag…".to_string());
+
+    let title = " Tags (Enter toggle) ";
+    let width = labels
+        .iter()
+        .map(|l| l.chars().count() as u16 + 4)
+        .max()
+        .unwrap_or(10)
+        .max((title.chars().count() as u16) + 2)
+        .max(20);
+    let height = (labels.len() as u16 + 2).max(3);
+    let rect = centered_rect(width, height, area);
+
+    let items: Vec<ListItem> = labels
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            let style = if i == t.selected { styles.selection } else { styles.default };
+            ListItem::new(Line::from(Span::styled(label.clone(), style)))
+        })
+        .collect();
+
+    let block = Block::bordered().title(Line::from(title)).border_style(styles.border);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(List::new(items).block(block), rect);
+}
+
+fn render_archive_browser(frame: &mut Frame, area: Rect, t: &ArchiveBrowserState, styles: &Styles) {
+    let visible = t.visible();
+    let title = if t.filter.is_empty() {
+        " Archive ".to_string()
+    } else {
+        format!(" Archive — /{} ", t.filter)
+    };
+    let width = visible
+        .iter()
+        .map(|task| (task.title.chars().count() + 13) as u16)
+        .max()
+        .unwrap_or(10)
+        .max(title.chars().count() as u16 + 2)
+        .max(30)
+        .min(area.width.max(4));
+    let height = ((visible.len().max(1)) as u16 + 2).max(3).min(area.height.max(3));
+    let rect = centered_rect(width, height, area);
+
+    let items: Vec<ListItem> = if visible.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            "— no matching archived tasks —",
+            styles.default.add_modifier(Modifier::DIM),
+        )))]
+    } else {
+        visible
+            .iter()
+            .enumerate()
+            .map(|(i, task)| {
+                let date = task.completed_at.map(dates::format_date).unwrap_or_else(|| "?".to_string());
+                let label = format!("{date}  {}", task.title);
+                let style = if i == t.selected { styles.selection } else { styles.default };
+                ListItem::new(Line::from(Span::styled(label, style)))
+            })
+            .collect()
+    };
+
+    let block = Block::bordered().title(Line::from(title)).border_style(styles.border);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(List::new(items).block(block), rect);
+}
+
 fn render_help(frame: &mut Frame, area: Rect, styles: &Styles) {
-    let rect = centered_rect(50, 12, area);
+    // Board, notes-pane and global bindings: a popup's own keys are already in the footer
+    // while it is open. Entries flow into extra columns when the terminal is
+    // too short to list them in one.
+    const COL_WIDTH: u16 = 23;
+    let entries: Vec<String> = crate::keymap::BINDINGS
+        .iter()
+        .filter(|b| matches!(b.ctx, crate::keymap::Ctx::Board | crate::keymap::Ctx::Notes | crate::keymap::Ctx::Global))
+        .map(|b| format!("{:<8} {:<13} ", b.keys, b.label))
+        .collect();
+    let max_rows = (area.height.saturating_sub(4) as usize).max(1);
+    let cols = entries.len().div_ceil(max_rows).max(1);
+    let rows = entries.len().div_ceil(cols);
+    let rect = centered_rect(COL_WIDTH * cols as u16 + 2, rows as u16 + 2, area);
     let block = Block::bordered().title(Line::from(" Help ")).border_style(styles.border);
     frame.render_widget(Clear, rect);
     frame.render_widget(block.clone(), rect);
     let inner = block.inner(rect);
-    let lines: Vec<Line> = crate::keymap::BINDINGS
-        .iter()
-        .map(|b| Line::from(format!("{:<8} {}", b.keys, b.label)))
+    let lines: Vec<Line> = (0..rows)
+        .map(|r| {
+            let row: String = (0..cols)
+                .filter_map(|c| entries.get(c * rows + r))
+                .map(String::as_str)
+                .collect();
+            Line::from(row)
+        })
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -643,6 +896,30 @@ mod tests {
     }
 
     #[test]
+    fn text_prompt_ctrl_u_clears_input() {
+        let mut p = TextPromptState { prompt: "New tag name".to_string(), input: "personal".to_string(), error: None };
+        let outcome = handle_text_prompt_key(&mut p, KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(matches!(outcome, PopupOutcome::Consumed));
+        assert_eq!(p.input, "");
+    }
+
+    #[test]
+    fn text_prompt_ctrl_w_deletes_previous_word() {
+        let mut p = TextPromptState { prompt: "New tag name".to_string(), input: "foo bar".to_string(), error: None };
+        let outcome = handle_text_prompt_key(&mut p, KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert!(matches!(outcome, PopupOutcome::Consumed));
+        assert_eq!(p.input, "foo ");
+    }
+
+    #[test]
+    fn text_prompt_ctrl_x_does_not_insert_char() {
+        let mut p = TextPromptState { prompt: "New tag name".to_string(), input: "test".to_string(), error: None };
+        let outcome = handle_text_prompt_key(&mut p, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert!(matches!(outcome, PopupOutcome::Consumed));
+        assert_eq!(p.input, "test"); // unchanged
+    }
+
+    #[test]
     fn text_prompt_enter_submits_typed_text() {
         let mut p = TextPromptState { prompt: "New tag name".to_string(), input: "urgent".to_string(), error: None };
         match handle_text_prompt_key(&mut p, key(KeyCode::Enter)) {
@@ -720,6 +997,50 @@ mod tests {
         assert!(matches!(handle_tag_picker_key(&mut t, key(KeyCode::Esc)), PopupOutcome::Close));
     }
 
+    // --- form-scoped tag picker ---------------------------------------------
+
+    fn sample_form_tag_picker() -> FormTagPickerState {
+        FormTagPickerState {
+            all_tags: vec!["home".to_string(), "work".to_string()],
+            applied: vec!["home".to_string()],
+            selected: 0,
+        }
+    }
+
+    #[test]
+    fn form_tag_picker_enter_on_tag_row_toggles() {
+        let mut t = sample_form_tag_picker();
+        match handle_form_tag_picker_key(&mut t, key(KeyCode::Enter)) {
+            PopupOutcome::FormTagPicker(FormTagPickerAction::Toggle(idx)) => assert_eq!(idx, 0),
+            other => panic!("expected FormTagPicker(Toggle), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn form_tag_picker_enter_on_new_row_starts_new_tag_flow() {
+        let mut t = sample_form_tag_picker();
+        t.selected = t.all_tags.len();
+        match handle_form_tag_picker_key(&mut t, key(KeyCode::Enter)) {
+            PopupOutcome::FormTagPicker(FormTagPickerAction::New) => {}
+            other => panic!("expected FormTagPicker(New), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn form_tag_picker_navigation_wraps_across_the_new_tag_row() {
+        let mut t = sample_form_tag_picker();
+        handle_form_tag_picker_key(&mut t, key(KeyCode::Char('k')));
+        assert_eq!(t.selected, 2);
+        handle_form_tag_picker_key(&mut t, key(KeyCode::Char('j')));
+        assert_eq!(t.selected, 0);
+    }
+
+    #[test]
+    fn form_tag_picker_esc_closes() {
+        let mut t = sample_form_tag_picker();
+        assert!(matches!(handle_form_tag_picker_key(&mut t, key(KeyCode::Esc)), PopupOutcome::Close));
+    }
+
     // --- stack-nesting behaviour (the highest-risk logic) ----------------
     //
     // These drive a small local stack the same way `App` does, to
@@ -740,6 +1061,8 @@ mod tests {
                 }
             }
             PopupOutcome::TagPicker(_) => {}
+            PopupOutcome::FormTagPicker(_) => {}
+            PopupOutcome::OpenArchivedTask(_) => {}
         }
     }
 
@@ -815,5 +1138,151 @@ mod tests {
         let outcome = stack.last_mut().unwrap().handle_key(key(KeyCode::Char('x')));
         apply(&mut stack, outcome);
         assert!(stack.is_empty());
+    }
+
+    fn help_text(width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let styles = crate::ui::theme::resolve(&crate::config::Theme::default(), crate::ui::theme::ColorDepth::TrueColor);
+        terminal
+            .draw(|f| render_help(f, f.area(), &styles))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn help_lists_board_notes_and_global_bindings() {
+        let text = help_text(140, 45);
+        for b in crate::keymap::BINDINGS.iter().filter(|b| matches!(b.ctx, crate::keymap::Ctx::Board | crate::keymap::Ctx::Notes | crate::keymap::Ctx::Global)) {
+            assert!(text.contains(b.label), "help is missing {:?}", b.keys);
+        }
+        assert!(text.contains("archive"));
+    }
+
+    #[test]
+    fn help_flows_into_columns_on_a_short_terminal() {
+        let text = help_text(140, 12);
+        assert!(text.contains("archive"), "archive cut off on a short terminal:\n{text}");
+    }
+
+    // --- archive browser ----------------------------------------------------
+
+    fn sample_task(id: TaskId, title: &str, completed_at: Option<i64>) -> Task {
+        Task {
+            id,
+            board_id: None,
+            title: title.to_string(),
+            body: String::new(),
+            status: Status::Done,
+            priority: crate::domain::task::Priority::Normal,
+            position: 0,
+            created_at: 0,
+            updated_at: 0,
+            start_date: None,
+            deadline: None,
+            completed_at,
+            tags: Vec::new(),
+        }
+    }
+
+    fn sample_archive() -> ArchiveBrowserState {
+        ArchiveBrowserState {
+            tasks: vec![
+                sample_task(1, "buy milk", Some(300)),
+                sample_task(2, "call bank", Some(200)),
+                sample_task(3, "buy eggs", Some(100)),
+            ],
+            filter: String::new(),
+            selected: 0,
+        }
+    }
+
+    #[test]
+    fn archive_visible_is_unfiltered_when_filter_is_empty() {
+        let a = sample_archive();
+        assert_eq!(a.visible().len(), 3);
+    }
+
+    #[test]
+    fn archive_filter_narrows_by_title_case_insensitively() {
+        let mut a = sample_archive();
+        a.filter = "BUY".to_string();
+        let titles: Vec<&str> = a.visible().iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, vec!["buy milk", "buy eggs"]);
+    }
+
+    #[test]
+    fn archive_filter_matches_body_and_tags_too() {
+        let mut a = sample_archive();
+        a.tasks[1].body = "ask about the mortgage".to_string();
+        a.filter = "mortgage".to_string();
+        assert_eq!(a.visible().len(), 1);
+        assert_eq!(a.visible()[0].id, 2);
+
+        a.filter = "nonsense".to_string();
+        assert!(a.visible().is_empty());
+    }
+
+    #[test]
+    fn archive_typing_appends_to_filter_and_resets_selection() {
+        let mut a = sample_archive();
+        a.selected = 2;
+        let outcome = handle_archive_key(&mut a, key(KeyCode::Char('b')));
+        assert!(matches!(outcome, PopupOutcome::Consumed));
+        assert_eq!(a.filter, "b");
+        assert_eq!(a.selected, 0);
+    }
+
+    #[test]
+    fn archive_backspace_edits_filter_and_resets_selection() {
+        let mut a = sample_archive();
+        a.filter = "buy".to_string();
+        a.selected = 1;
+        handle_archive_key(&mut a, key(KeyCode::Backspace));
+        assert_eq!(a.filter, "bu");
+        assert_eq!(a.selected, 0);
+    }
+
+    #[test]
+    fn archive_j_k_do_not_reach_the_filter_and_wrap_around() {
+        let mut a = sample_archive();
+        handle_archive_key(&mut a, key(KeyCode::Char('j')));
+        assert_eq!(a.selected, 1);
+        assert_eq!(a.filter, "", "j must navigate, not type");
+        handle_archive_key(&mut a, key(KeyCode::Char('k')));
+        assert_eq!(a.selected, 0);
+        handle_archive_key(&mut a, key(KeyCode::Char('k')));
+        assert_eq!(a.selected, 2, "k from the top wraps to the last row");
+    }
+
+    #[test]
+    fn archive_enter_opens_the_selected_visible_task() {
+        let mut a = sample_archive();
+        a.filter = "call".to_string();
+        match handle_archive_key(&mut a, key(KeyCode::Enter)) {
+            PopupOutcome::OpenArchivedTask(id) => assert_eq!(id, 2),
+            other => panic!("expected OpenArchivedTask, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn archive_esc_closes() {
+        let mut a = sample_archive();
+        assert!(matches!(handle_archive_key(&mut a, key(KeyCode::Esc)), PopupOutcome::Close));
+    }
+
+    #[test]
+    fn archive_enter_on_empty_filtered_list_does_nothing() {
+        let mut a = sample_archive();
+        a.filter = "no such task".to_string();
+        assert!(matches!(handle_archive_key(&mut a, key(KeyCode::Enter)), PopupOutcome::Consumed));
     }
 }
