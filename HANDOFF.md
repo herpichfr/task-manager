@@ -5,11 +5,20 @@ SQLite-backed, with password-protected boards whose database file is itself
 encrypted.
 
 **Status**: all 14 original requirements plus a round of user feedback are done
-and verified. 350 tests pass, `cargo clippy --all-targets -- -D warnings` is
-clean, ~13,000 lines. Approved plan: `~/.claude/plans/silly-tinkering-perlis.md`.
+and verified. 370 tests pass, `cargo clippy --all-targets -- -D warnings` is
+clean, ~13,300 lines. Approved plan: `~/.claude/plans/silly-tinkering-perlis.md`.
 
-Installed binary: `~/.local/bin/tsk` (8 MB, release, stripped). Rebuild and
-reinstall with `./install.sh`.
+Latest work (Dropbox sync safety, arrow keys, editor popup over the board) is
+merged into `main`, together with a user-facing `README.md` (AI-built
+disclaimer below the title) and `CHANGELOG.md`. Version is `0.1.0-alpha.1`,
+tagged locally as annotated tag `v0.1.0-alpha.1`. **Nothing has been pushed**:
+publish with `git push origin main v0.1.0-alpha.1`, then create the GitHub
+release from that tag (mark it *pre-release*; paste the CHANGELOG entry as
+the notes). `gh` is not installed on this machine.
+
+Installed binary: `~/.local/bin/tsk` (8 MB, release, stripped). It includes the
+sync features but **predates the arrow-key and popup changes** — rerun
+`./install.sh` to pick them up.
 
 ---
 
@@ -22,7 +31,7 @@ reinstall with `./install.sh`.
 
 export PATH="$HOME/.cargo/bin:$PATH"     # rustup toolchain, rustc 1.98.1
 cargo build                              # or --release
-cargo test                               # 350 tests, all headless
+cargo test                               # 370 tests, all headless
 cargo clippy --all-targets -- -D warnings
 ./target/debug/tsk                       # needs a real TTY
 TSK_DB_DIR=/tmp/scratch ./target/debug/tsk   # isolated database
@@ -148,9 +157,11 @@ previously world-readable at the mercy of the umask. Tests assert both.
   **nvim** → `$VISUAL` → `$EDITOR` → vim. nvim must keep outranking the
   environment variables — this is a standing user requirement, and deferring to
   an unset `$EDITOR` would silently land on `vi`/`nano`. A test guards it.
-- The repo lives under `~/Dropbox`, so the database default is
-  `~/.local/share/tsk`, never a synced directory — concurrent sync corrupts
-  SQLite WAL files.
+- **The live data dir is in Dropbox**: `/home/herpich/Dropbox/task-manager/data`
+  (git-ignored), set by `~/.config/tsk/config.toml` together with
+  `journal_mode = "delete"`. The XDG default `~/.local/share/tsk` is no longer
+  used; its `main.db` is kept only as a pre-migration backup. Never point a
+  synced dir at `tsk` with WAL on — see "Dropbox two-machine setup" below.
 - `~/.config/nvim` is AstroNvim (leader `Space`), which is why `<Space>b` also
   opens the board switcher.
 
@@ -158,7 +169,7 @@ previously world-readable at the mercy of the umask. Tests assert both.
 
 ## Keybindings
 
-`h/l` column · `j/k` move · `gg`/`G` · `^d`/`^u` · `Tab` pane · `a`/`i` new ·
+`h/l` or `←/→` column · `j/k` or `↑/↓` move (counts work: `3↓`) · `gg`/`G` · `^d`/`^u` · `Tab` pane · `a`/`i` new ·
 `e` edit · `o` body in nvim · `H`/`L` move column · `J`/`K` reorder · `m`/`p`/`t`
 dropdowns · `dd` delete · `c` capture note · `N` notes pane · `gp` promote ·
 `b` or `<Space>b` boards (`a`/`A` new plain/locked board, `dd`/`D` delete
@@ -166,7 +177,9 @@ highlighted) · `S` status dropdown · `A` archive browser · `u`/`^r` undo/redo
 `/` search (`n`/`N` next/prev match, `Esc` or `:nohl` clears) · `:` command ·
 `?` help · `ZZ` quit. In the notes pane `a`/`e`/`dd` act on notes. Commands: `:board` (opens an action
 menu: new/new locked/rename current/delete…/switch…/lock), `:board new <name> [locked]`,
-`:board rename <name>`, `:board delete <name>`, `:lock`, `:q`.
+`:board rename <name>`, `:board delete <name>`, `:lock`, `:e`/`:reload` (re-read
+the database from disk), `:q`. Arrows are listed in `?` help but deliberately
+not in the footer, which keeps its old length (`Ctx::BoardArrows` in keymap).
 
 ---
 
@@ -281,26 +294,24 @@ and the help popup showing `A`.
    is submitted (Ctrl-S), which upserts each name and calls
    `set_task_tags`. The edit form is seeded with the task's current tags.
    Not undoable, the same as the card-level `t` toggle.
-5. **README + packaging**: `cargo-deb` for Debian. `install.sh` covers
-   source installs already.
+5. **Packaging**: `cargo-deb` for Debian. `install.sh` covers source installs
+   already; `README.md` is written.
 6. **Linux Mint MATE is unverified.** Plan is a static
    `x86_64-unknown-linux-musl` build as the universal artifact, which avoids the
    glibc skew between Debian 13 (2.41) and Mint 22 (2.39). **Blocked**: needs
    `sudo apt install musl-tools`, which was never run. Building natively on the
    Mint machine (`./install.sh`) is the alternative.
-7. **The tmux floating editor now hovers over the board, but is still not
-   verified against a real tmux popup.** `edit_text` (`src/editor.rs`) no
-   longer applies the suspend/restore sequence in the tmux path: raw mode and
-   the alternate screen are left untouched, so the board stays drawn
-   underneath the floating `tmux display-popup`, titled with the task's (or
-   form's) title via `-T`. The `tmux` client's own stdio is `/dev/null` so it
-   cannot write into the pane, and any crossterm input queued while the popup
-   had focus is drained (non-blocking) once it exits. Outside tmux, the
-   suspend/restore sequence is unchanged. The tmux/no-tmux decision is now
-   the pure `needs_suspend` function, unit-tested both ways, and
-   `editor_invocation`'s argument list (including `-T`) is unit-tested too --
-   but nobody has yet watched `tmux display-popup` actually float over the
-   board in a real terminal. Verify in a real tmux session.
+7. ~~**The tmux floating editor is not verified against a real tmux popup.**~~
+   **DONE.** Inside tmux, `edit_text` (`src/editor.rs`) no longer suspends:
+   raw mode and the alternate screen are left alone, so the board stays drawn
+   underneath the `tmux display-popup` (titled with the task's or form's title
+   via `-T`). The `tmux` client's stdio is `/dev/null`, and crossterm input
+   queued while the popup had focus is drained once it exits. Outside tmux the
+   full-screen suspend/restore is unchanged. The decision is the pure
+   `needs_suspend` function, unit-tested both ways. Verified in a real tmux
+   server with an attached client: the pane kept the board while the popup was
+   open, the popup border carried the task title, and the edited body was
+   saved on return.
 8. Undo/redo is in-memory per session and does not survive a restart. Normal for
    a vim-style tool; confirm with the user if persistence is wanted.
 9. **Archive browser filter cannot contain `j`/`k`** because those keys
@@ -371,3 +382,29 @@ true for that to be safe, and both are done:
    the status line reads "reloaded: database changed on disk". A manual
    reload is also reachable via `:e` or `:reload`, both of which now bind to
    `Action::Refresh` (previously defined but unbound).
+
+**Verified under a real terminal** (tmux, scratch copy of the data): opening an
+existing WAL database with `journal_mode = "delete"` converted it and left no
+`-wal`; replacing `main.db` via write-then-rename under a running `tsk` showed
+the other copy's task within ~1s with the reload message; a move afterwards
+landed in the new file; the app's own writes never triggered a reload; `ZZ`
+left only `main.db` in the directory.
+
+**Second machine (laptop) setup**: same absolute repo path via Dropbox; run
+`./install.sh` there, and create its own `~/.config/tsk/config.toml` (not
+synced) with:
+
+    db_dir = "/home/herpich/Dropbox/task-manager/data"
+    journal_mode = "delete"
+
+Remaining risks are habits, not code: let Dropbox reach "Up to date" before
+opening `tsk` and before closing the laptop, and quit with `ZZ` before
+switching machines. Offline edits on both sides would produce a Dropbox
+"conflicted copy" file that `tsk` does not detect (optional future work).
+
+**Testing trick for tmux popups**: `display-popup` needs an attached client,
+which a detached `tmux new-session -d` lacks. Start an isolated server
+(`tmux -L poptest -f /dev/null new-session -d ...`), attach a client in a pty
+with `script -qfc "tmux -L poptest attach -t t" <log>`, and use a config whose
+`editor` is a script that sleeps then appends to `$1`. `capture-pane` shows
+the pane under the popup; the `script` log shows the popup itself.

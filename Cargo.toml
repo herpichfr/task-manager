@@ -1,6 +1,6 @@
 [package]
 name = "tsk"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2021"
 rust-version = "1.85"
 description = "Vim-native terminal kanban task manager and quick note taker with encrypted boards"
