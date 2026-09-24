@@ -501,7 +501,7 @@ fn field_label(field: Field, is_note: bool) -> &'static str {
         Field::Priority => "Priority",
         Field::Tags => "Tags",
         Field::Start => "Start",
-        Field::DaysExpected => "Days expected",
+        Field::TimeExpected => "TimeExpected",
         Field::Deadline => "Deadline",
         Field::Body => {
             if is_note {
@@ -551,8 +551,8 @@ fn render_form(frame: &mut Frame, area: Rect, f: &FormState, styles: &Styles) {
             Span::styled(f.start_text.clone(), styles.default),
         ]));
         lines.push(Line::from(vec![
-            Span::styled(format!("{}: ", field_label(Field::DaysExpected, false)), field_style(Field::DaysExpected)),
-            Span::styled(f.days_expected_text.clone(), styles.default),
+            Span::styled(format!("{}: ", field_label(Field::TimeExpected, false)), field_style(Field::TimeExpected)),
+            Span::styled(f.time_expected_text.clone(), styles.default),
         ]));
         lines.push(Line::from(vec![
             Span::styled(format!("{}: ", field_label(Field::Deadline, false)), field_style(Field::Deadline)),
@@ -1228,7 +1228,9 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             start_date: None,
-            days_expected: None, deadline: None,
+            time_expected: None,
+            deadline: None,
+            deadline_notified_at: None,
             completed_at,
             tags: Vec::new(),
         }

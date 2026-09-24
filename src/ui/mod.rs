@@ -53,7 +53,7 @@ mod tests {
                             status,
                             priority: Priority::Normal,
                             start_date: None,
-                            days_expected: None, deadline: None,
+                            time_expected: None, deadline: None,
                         })
                         .unwrap();
                 }

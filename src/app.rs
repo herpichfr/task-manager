@@ -467,6 +467,12 @@ impl<'a> TaskStore for ActiveStore<'a> {
             ActiveStore::Locked(s) => s.update_task(id, patch),
         }
     }
+    fn mark_deadline_notified(&self, id: TaskId) -> std::result::Result<(), StorageError> {
+        match self {
+            ActiveStore::Plain(s) => s.mark_deadline_notified(id),
+            ActiveStore::Locked(s) => s.mark_deadline_notified(id),
+        }
+    }
     fn move_task(&self, id: TaskId, to: Status, index: i64) -> std::result::Result<(), StorageError> {
         match self {
             ActiveStore::Plain(s) => s.move_task(id, to, index),
@@ -725,6 +731,33 @@ impl App {
         }
         self.last_external_check = Some(now);
         self.reconcile_external_change();
+    }
+
+    /// Active tasks whose deadline has passed and has not yet produced a
+    /// desktop notification. The event loop calls this every tick; the
+    /// notification is persisted only after the desktop service accepts it.
+    pub fn unnotified_deadline_tasks(&self) -> Vec<Task> {
+        let now = chrono::Utc::now().timestamp();
+        self.columns[..2]
+            .iter()
+            .flat_map(|column| column.tasks.iter())
+            .filter(|task| task.deadline.is_some_and(|deadline| deadline <= now) && task.deadline_notified_at.is_none())
+            .cloned()
+            .collect()
+    }
+
+    /// Records that a deadline alert was delivered and updates the cached
+    /// task, preventing another event-loop tick from sending it again.
+    pub fn mark_deadline_notified(&mut self, id: TaskId) -> Result<()> {
+        self.store().mark_deadline_notified(id).map_err(storage_err)?;
+        self.record_fingerprints();
+        for column in &mut self.columns[..2] {
+            if let Some(task) = column.tasks.iter_mut().find(|task| task.id == id) {
+                task.deadline_notified_at = Some(chrono::Utc::now().timestamp());
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// Compares the active database file(s) against the last-recorded
@@ -1238,7 +1271,7 @@ impl App {
                     task.priority,
                     task.status,
                     task.start_date,
-                    task.days_expected,
+                    task.time_expected,
                     task.deadline,
                     tags,
                 )));
@@ -1383,7 +1416,7 @@ impl App {
                     status,
                     priority: draft.priority,
                     start_date: draft.start_date,
-                    days_expected: draft.days_expected,
+                    time_expected: draft.time_expected,
                     deadline: draft.deadline,
                 };
                 match store.create_task(new_task) {
@@ -1422,7 +1455,7 @@ impl App {
                     status: None,
                     priority: Some(before_task.priority),
                     start_date: Some(before_task.start_date),
-                    days_expected: Some(before_task.days_expected),
+                    time_expected: Some(before_task.time_expected),
                     deadline: Some(before_task.deadline),
                 };
                 let after = TaskPatch {
@@ -1431,7 +1464,7 @@ impl App {
                     status: None,
                     priority: Some(draft.priority),
                     start_date: Some(draft.start_date),
-                    days_expected: Some(draft.days_expected),
+                    time_expected: Some(draft.time_expected),
                     deadline: Some(draft.deadline),
                 };
                 if let Err(e) = store.update_task(id, after.clone()) {
@@ -1713,7 +1746,7 @@ impl App {
                     status: snapshot.status,
                     priority: snapshot.priority,
                     start_date: snapshot.start_date,
-                    days_expected: snapshot.days_expected,
+                    time_expected: snapshot.time_expected,
                     deadline: snapshot.deadline,
                 })?;
                 store.move_task(new_id, snapshot.status, snapshot.position)?;
@@ -2463,7 +2496,7 @@ impl App {
                             task.priority,
                             task.status,
                             task.start_date,
-                            task.days_expected,
+                            task.time_expected,
                             task.deadline,
                             tags,
                         )));
@@ -2720,13 +2753,37 @@ mod tests {
                         status: Status::ToDo,
                         priority: DomainPriority::Normal,
                     start_date: None,
-                    days_expected: None, deadline: None,
+                    time_expected: None,
+                    deadline: None,
                     })
                     .unwrap();
             }
         }
         let board = db.get_board_by_name("test").unwrap().unwrap();
         App::new(Config::default(), db, board).unwrap()
+    }
+
+    #[test]
+    fn deadline_notifications_are_recorded_once() {
+        let mut app = test_app_with_tasks();
+        let id = app
+            .store()
+            .create_task(DomainNewTask {
+                title: "overdue".to_string(),
+                body: String::new(),
+                status: Status::ToDo,
+                priority: DomainPriority::Normal,
+                start_date: None,
+                time_expected: None,
+                deadline: Some(chrono::Utc::now().timestamp() - 1),
+            })
+            .unwrap();
+        app.reload().unwrap();
+
+        assert_eq!(app.unnotified_deadline_tasks().iter().map(|task| task.id).collect::<Vec<_>>(), vec![id]);
+        app.mark_deadline_notified(id).unwrap();
+        assert!(app.unnotified_deadline_tasks().is_empty());
+        assert!(app.store().get_task(id).unwrap().deadline_notified_at.is_some());
     }
 
     /// Same shape as `test_app_with_tasks`, but backed by a real on-disk
@@ -2745,7 +2802,7 @@ mod tests {
                 status: Status::ToDo,
                 priority: DomainPriority::Normal,
                 start_date: None,
-                days_expected: None, deadline: None,
+                time_expected: None, deadline: None,
             })
             .unwrap();
         let board = db.get_board_by_name("test").unwrap().unwrap();
@@ -2774,7 +2831,7 @@ mod tests {
                     status: Status::ToDo,
                     priority: DomainPriority::Normal,
                     start_date: None,
-                    days_expected: None, deadline: None,
+                    time_expected: None, deadline: None,
                 })
                 .unwrap();
         }
@@ -3433,7 +3490,7 @@ mod tests {
             status: Status::ToDo,
             priority: DomainPriority::Normal,
             start_date: None,
-            days_expected: None, deadline: None,
+            time_expected: None, deadline: None,
         }).unwrap();
         let _ = app.reload();
         // titles now: a, b, c, abc -- "a" matches "a" (idx 0) and "abc" (idx 3)
@@ -3503,7 +3560,7 @@ mod tests {
                         status: Status::ToDo,
                         priority: DomainPriority::Normal,
                         start_date: None,
-                        days_expected: None, deadline: None,
+                        time_expected: None, deadline: None,
                     })
                     .unwrap();
             }
@@ -3579,7 +3636,7 @@ mod tests {
                         status: Status::Doing,
                         priority: DomainPriority::Normal,
                         start_date: None,
-                        days_expected: None, deadline: None,
+                        time_expected: None, deadline: None,
                     })
                     .unwrap();
             }
@@ -4249,8 +4306,9 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             start_date: None,
-            days_expected: None,
+            time_expected: None,
             deadline,
+            deadline_notified_at: None,
             completed_at: None,
             tags: Vec::new(),
         }
@@ -4331,7 +4389,7 @@ mod tests {
             status: Status::ToDo,
             priority: DomainPriority::Normal,
             start_date: None,
-            days_expected: None,
+            time_expected: None,
             deadline,
         }
     }

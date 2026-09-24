@@ -124,6 +124,9 @@ impl<'a> TaskStore for LockedBoardStore<'a> {
     fn update_task(&self, id: TaskId, patch: TaskPatch) -> Result<(), StorageError> {
         shared::update_task(self.conn, None, id, patch)
     }
+    fn mark_deadline_notified(&self, id: TaskId) -> Result<(), StorageError> {
+        shared::mark_deadline_notified(self.conn, None, id)
+    }
     fn move_task(&self, id: TaskId, to: Status, index: i64) -> Result<(), StorageError> {
         shared::move_task(self.conn, None, id, to, index)
     }
@@ -201,7 +204,7 @@ mod tests {
                     status: Status::ToDo,
                     priority: Priority::Normal,
                     start_date: None,
-                    days_expected: None, deadline: None,
+                    time_expected: None, deadline: None,
                 })
                 .unwrap();
         }
@@ -264,7 +267,7 @@ mod tests {
                     status: Status::ToDo,
                     priority: Priority::Normal,
                     start_date: None,
-                    days_expected: None, deadline: None,
+                    time_expected: None, deadline: None,
                 })
                 .unwrap();
         }
@@ -311,7 +314,7 @@ mod tests {
                     status: Status::ToDo,
                     priority: Priority::Normal,
                     start_date: None,
-                    days_expected: None, deadline: None,
+                    time_expected: None, deadline: None,
                 })
                 .unwrap();
         }
@@ -332,13 +335,13 @@ mod tests {
         let store = db.store();
 
         let a = store
-            .create_task(NewTask { title: "a".into(), body: String::new(), status: Status::ToDo, priority: Priority::Normal, start_date: None, days_expected: None, deadline: None })
+            .create_task(NewTask { title: "a".into(), body: String::new(), status: Status::ToDo, priority: Priority::Normal, start_date: None, time_expected: None, deadline: None })
             .unwrap();
         let b = store
-            .create_task(NewTask { title: "b".into(), body: String::new(), status: Status::ToDo, priority: Priority::Normal, start_date: None, days_expected: None, deadline: None })
+            .create_task(NewTask { title: "b".into(), body: String::new(), status: Status::ToDo, priority: Priority::Normal, start_date: None, time_expected: None, deadline: None })
             .unwrap();
         let c = store
-            .create_task(NewTask { title: "c".into(), body: String::new(), status: Status::ToDo, priority: Priority::Normal, start_date: None, days_expected: None, deadline: None })
+            .create_task(NewTask { title: "c".into(), body: String::new(), status: Status::ToDo, priority: Priority::Normal, start_date: None, time_expected: None, deadline: None })
             .unwrap();
 
         store.move_task(a, Status::Doing, 0).unwrap();

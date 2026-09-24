@@ -98,6 +98,17 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut A
         // while a popup or form is open, and any later write goes to the
         // new file instead of an orphaned one.
         app.check_external_change();
+        for task in app.unnotified_deadline_tasks() {
+            let body = format!("\"{}\" has reached its deadline.", task.title);
+            match notify_rust::Notification::new().summary("tsk deadline reached").body(&body).show() {
+                Ok(_) => {
+                    if let Err(e) = app.mark_deadline_notified(task.id) {
+                        app.message = Some(format!("could not record deadline notification: {e}"));
+                    }
+                }
+                Err(e) => app.message = Some(format!("desktop notification failed: {e}")),
+            }
+        }
 
         if app.should_quit {
             break;

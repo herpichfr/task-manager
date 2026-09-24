@@ -81,8 +81,43 @@ const BOARD_V4: &str = "
 ALTER TABLE tasks ADD COLUMN days_expected INTEGER;
 ";
 
-pub const MIGRATIONS_MAIN: &[(i64, &str)] = &[(1, MAIN_V1), (2, MAIN_V2), (3, MAIN_V3), (4, MAIN_V4)];
-pub const MIGRATIONS_BOARD: &[(i64, &str)] = &[(1, BOARD_V1), (2, BOARD_V2), (3, BOARD_V3), (4, BOARD_V4)];
+// v5 replaces the day-only duration with a duration in seconds. Retain the
+// v4 column for existing databases, but copy its values so a prior `3d`
+// duration becomes the equivalent `3d` in the new m/h/d form.
+const MAIN_V5: &str = "
+ALTER TABLE tasks ADD COLUMN time_expected INTEGER;
+UPDATE tasks SET time_expected = days_expected * 86400 WHERE days_expected IS NOT NULL;
+";
+
+const BOARD_V5: &str = "
+ALTER TABLE tasks ADD COLUMN time_expected INTEGER;
+UPDATE tasks SET time_expected = days_expected * 86400 WHERE days_expected IS NOT NULL;
+";
+
+const MAIN_V6: &str = "
+ALTER TABLE tasks ADD COLUMN deadline_notified_at INTEGER;
+";
+
+const BOARD_V6: &str = "
+ALTER TABLE tasks ADD COLUMN deadline_notified_at INTEGER;
+";
+
+pub const MIGRATIONS_MAIN: &[(i64, &str)] = &[
+    (1, MAIN_V1),
+    (2, MAIN_V2),
+    (3, MAIN_V3),
+    (4, MAIN_V4),
+    (5, MAIN_V5),
+    (6, MAIN_V6),
+];
+pub const MIGRATIONS_BOARD: &[(i64, &str)] = &[
+    (1, BOARD_V1),
+    (2, BOARD_V2),
+    (3, BOARD_V3),
+    (4, BOARD_V4),
+    (5, BOARD_V5),
+    (6, BOARD_V6),
+];
 
 const CREATE_VERSION_TABLE: &str = "CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER PRIMARY KEY,
@@ -155,7 +190,7 @@ mod tests {
         let task_id = conn.last_insert_rowid();
 
         apply(&conn, MIGRATIONS_MAIN).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 4);
+        assert_eq!(current_version(&conn).unwrap(), 6);
 
         let (title, start_date, deadline): (String, Option<i64>, Option<i64>) = conn
             .query_row(
@@ -189,7 +224,7 @@ mod tests {
         let task_id = conn.last_insert_rowid();
 
         apply(&conn, MIGRATIONS_BOARD).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 4);
+        assert_eq!(current_version(&conn).unwrap(), 6);
 
         let (title, start_date, deadline): (String, Option<i64>, Option<i64>) = conn
             .query_row(
@@ -208,9 +243,39 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         assert_eq!(current_version(&conn).unwrap(), 0);
         apply(&conn, MIGRATIONS_MAIN).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 4);
+        assert_eq!(current_version(&conn).unwrap(), 6);
         apply(&conn, MIGRATIONS_MAIN).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 4);
+        assert_eq!(current_version(&conn).unwrap(), 6);
+    }
+
+    #[test]
+    fn v4_to_v5_migration_converts_days_to_seconds() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply(&conn, &MIGRATIONS_MAIN[0..4]).unwrap();
+        conn.execute(
+            "INSERT INTO boards (name, kind, position, created_at, updated_at)
+             VALUES ('alpha', 'plain', 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        let board_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO tasks (board_id, title, status, priority, position, created_at, updated_at, days_expected)
+             VALUES (?1, 'duration', 'todo', 'normal', 0, 0, 0, 3)",
+            rusqlite::params![board_id],
+        )
+        .unwrap();
+        let task_id = conn.last_insert_rowid();
+
+        apply(&conn, MIGRATIONS_MAIN).unwrap();
+        let time_expected: Option<i64> = conn
+            .query_row(
+                "SELECT time_expected FROM tasks WHERE id = ?1",
+                rusqlite::params![task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(time_expected, Some(3 * 86_400));
     }
 
     /// A v2 database with an existing Done row must upgrade to v3 in
@@ -245,7 +310,7 @@ mod tests {
         let todo_id = conn.last_insert_rowid();
 
         apply(&conn, MIGRATIONS_MAIN).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 4);
+        assert_eq!(current_version(&conn).unwrap(), 6);
 
         let done_completed: Option<i64> = conn
             .query_row(
@@ -293,7 +358,7 @@ mod tests {
         let todo_id = conn.last_insert_rowid();
 
         apply(&conn, MIGRATIONS_BOARD).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 4);
+        assert_eq!(current_version(&conn).unwrap(), 6);
 
         let done_completed: Option<i64> = conn
             .query_row(

@@ -64,9 +64,42 @@ pub fn format_date(ts: i64) -> String {
     local_date_from_epoch(ts).format("%Y-%m-%d").to_string()
 }
 
-/// Adds calendar days while preserving local-date semantics.
-pub fn add_days(ts: i64, days: i64) -> i64 {
-    midnight_epoch(local_date_from_epoch(ts) + Duration::days(days))
+/// Parses a duration entered as `<number>[m|h|d]`. A missing suffix means
+/// minutes; `m`, `h`, and `d` mean minutes, hours, and days respectively.
+pub fn parse_duration(input: &str) -> Result<Option<i64>, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let (number, multiplier) = match trimmed.chars().last() {
+        Some('m') => (&trimmed[..trimmed.len() - 1], 60),
+        Some('h') => (&trimmed[..trimmed.len() - 1], 60 * 60),
+        Some('d') => (&trimmed[..trimmed.len() - 1], 24 * 60 * 60),
+        Some(c) if c.is_ascii_digit() => (trimmed, 60),
+        _ => return Err("time expected must be a number followed by m, h, or d".to_string()),
+    };
+    let value = number.parse::<i64>().map_err(|_| "time expected must be a whole number".to_string())?;
+    value
+        .checked_mul(multiplier)
+        .map(Some)
+        .ok_or_else(|| "time expected is too large".to_string())
+}
+
+/// Formats seconds in the most readable exact unit.
+pub fn format_duration(seconds: i64) -> String {
+    if seconds % (24 * 60 * 60) == 0 {
+        format!("{}d", seconds / (24 * 60 * 60))
+    } else if seconds % (60 * 60) == 0 {
+        format!("{}h", seconds / (60 * 60))
+    } else {
+        format!("{}m", seconds / 60)
+    }
+}
+
+/// Adds an expected duration to a start timestamp.
+pub fn add_duration(start: i64, duration: i64) -> i64 {
+    start.saturating_add(duration)
 }
 
 /// Whole days from `now` until `deadline`, negative when overdue. Both are
@@ -202,6 +235,23 @@ mod tests {
         let now = fixed_now();
         let ts = parse_date("2030-07-04", now).unwrap().unwrap();
         assert_eq!(format_date(ts), "2030-07-04");
+    }
+
+    #[test]
+    fn duration_parses_minutes_hours_days_and_bare_minutes() {
+        assert_eq!(parse_duration("10").unwrap(), Some(600));
+        assert_eq!(parse_duration("10m").unwrap(), Some(600));
+        assert_eq!(parse_duration("4h").unwrap(), Some(14_400));
+        assert_eq!(parse_duration("15d").unwrap(), Some(1_296_000));
+        assert_eq!(parse_duration("").unwrap(), None);
+        assert!(parse_duration("4w").is_err());
+    }
+
+    #[test]
+    fn duration_formats_with_the_largest_exact_unit() {
+        assert_eq!(format_duration(600), "10m");
+        assert_eq!(format_duration(14_400), "4h");
+        assert_eq!(format_duration(1_296_000), "15d");
     }
 
     #[test]

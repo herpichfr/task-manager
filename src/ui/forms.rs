@@ -26,7 +26,7 @@ pub enum Field {
     Priority,
     Tags,
     Start,
-    DaysExpected,
+    TimeExpected,
     Deadline,
     Body,
 }
@@ -45,8 +45,11 @@ pub struct FormState {
     /// Empty means "no date" (parses to `None`, clearing it).
     pub start_text: String,
     pub start_cursor: usize,
-    pub days_expected_text: String,
-    pub days_expected_cursor: usize,
+    /// New tasks default Start to the current calendar date for display, but
+    /// retain the actual creation timestamp until the user edits Start.
+    pub start_is_default: bool,
+    pub time_expected_text: String,
+    pub time_expected_cursor: usize,
     pub deadline_text: String,
     pub deadline_cursor: usize,
     pub body: String,
@@ -67,7 +70,7 @@ pub struct TaskDraft {
     pub tags: Vec<String>,
     /// Unix seconds; `None` clears the field.
     pub start_date: Option<i64>,
-    pub days_expected: Option<i64>,
+    pub time_expected: Option<i64>,
     /// Unix seconds; `None` clears the field.
     pub deadline: Option<i64>,
     pub editing_id: Option<i64>,
@@ -75,7 +78,7 @@ pub struct TaskDraft {
 }
 
 const TASK_FIELDS: [Field; 8] =
-    [Field::Title, Field::Status, Field::Priority, Field::Tags, Field::Start, Field::DaysExpected, Field::Deadline, Field::Body];
+    [Field::Title, Field::Status, Field::Priority, Field::Tags, Field::Start, Field::TimeExpected, Field::Deadline, Field::Body];
 const NOTE_FIELDS: [Field; 2] = [Field::Title, Field::Body];
 
 fn status_label(status: Status) -> &'static str {
@@ -152,8 +155,9 @@ impl FormState {
             tags: Vec::new(),
             start_text: dates::format_date(chrono::Utc::now().timestamp()),
             start_cursor: 10,
-            days_expected_text: String::new(),
-            days_expected_cursor: 0,
+            start_is_default: true,
+            time_expected_text: String::new(),
+            time_expected_cursor: 0,
             deadline_text: String::new(),
             deadline_cursor: 0,
             body: String::new(),
@@ -173,8 +177,9 @@ impl FormState {
             tags: Vec::new(),
             start_text: String::new(),
             start_cursor: 0,
-            days_expected_text: String::new(),
-            days_expected_cursor: 0,
+            start_is_default: false,
+            time_expected_text: String::new(),
+            time_expected_cursor: 0,
             deadline_text: String::new(),
             deadline_cursor: 0,
             body: String::new(),
@@ -195,7 +200,7 @@ impl FormState {
         priority: Priority,
         status: Status,
         start_date: Option<i64>,
-        days_expected: Option<i64>,
+        time_expected: Option<i64>,
         deadline: Option<i64>,
         tags: Vec<String>,
     ) -> Self {
@@ -203,8 +208,8 @@ impl FormState {
         let start_text = start_date.map(dates::format_date).unwrap_or_default();
         let deadline_text = deadline.map(dates::format_date).unwrap_or_default();
         let start_cursor = start_text.len();
-        let days_expected_text = days_expected.map(|days| days.to_string()).unwrap_or_default();
-        let days_expected_cursor = days_expected_text.len();
+        let time_expected_text = time_expected.map(dates::format_duration).unwrap_or_default();
+        let time_expected_cursor = time_expected_text.len();
         let deadline_cursor = deadline_text.len();
         FormState {
             kind: FormKind::EditTask,
@@ -215,8 +220,9 @@ impl FormState {
             tags,
             start_text,
             start_cursor,
-            days_expected_text,
-            days_expected_cursor,
+            start_is_default: false,
+            time_expected_text,
+            time_expected_cursor,
             deadline_text,
             deadline_cursor,
             body,
@@ -243,8 +249,9 @@ impl FormState {
             tags: Vec::new(),
             start_text: String::new(),
             start_cursor: 0,
-            days_expected_text: String::new(),
-            days_expected_cursor: 0,
+            start_is_default: false,
+            time_expected_text: String::new(),
+            time_expected_cursor: 0,
             deadline_text: String::new(),
             deadline_cursor: 0,
             body: rest,
@@ -343,21 +350,23 @@ impl FormState {
             Field::Priority => self.handle_priority_key(key),
             Field::Tags => self.handle_tags_key(key),
             Field::Start => self.handle_date_key(key, true),
-            Field::DaysExpected => self.handle_days_expected_key(key),
+            Field::TimeExpected => self.handle_time_expected_key(key),
             Field::Deadline => self.handle_date_key(key, false),
             Field::Body => PopupOutcome::Consumed, // Enter on Body is handled by App (needs the terminal).
         }
     }
 
-    fn handle_days_expected_key(&mut self, key: KeyEvent) -> PopupOutcome {
+    fn handle_time_expected_key(&mut self, key: KeyEvent) -> PopupOutcome {
             match key.code {
-                KeyCode::Char(c) if c.is_ascii_digit() => text_insert_char(&mut self.days_expected_text, &mut self.days_expected_cursor, c),
-                KeyCode::Backspace => text_backspace(&mut self.days_expected_text, &mut self.days_expected_cursor),
-                KeyCode::Delete => text_delete_forward(&mut self.days_expected_text, &mut self.days_expected_cursor),
-                KeyCode::Left => text_cursor_left(&self.days_expected_text, &mut self.days_expected_cursor),
-                KeyCode::Right => text_cursor_right(&self.days_expected_text, &mut self.days_expected_cursor),
-                KeyCode::Home => self.days_expected_cursor = 0,
-                KeyCode::End => self.days_expected_cursor = self.days_expected_text.len(),
+                KeyCode::Char(c) if c.is_ascii_digit() || matches!(c, 'm' | 'h' | 'd') => {
+                    text_insert_char(&mut self.time_expected_text, &mut self.time_expected_cursor, c)
+                }
+                KeyCode::Backspace => text_backspace(&mut self.time_expected_text, &mut self.time_expected_cursor),
+                KeyCode::Delete => text_delete_forward(&mut self.time_expected_text, &mut self.time_expected_cursor),
+                KeyCode::Left => text_cursor_left(&self.time_expected_text, &mut self.time_expected_cursor),
+                KeyCode::Right => text_cursor_right(&self.time_expected_text, &mut self.time_expected_cursor),
+                KeyCode::Home => self.time_expected_cursor = 0,
+                KeyCode::End => self.time_expected_cursor = self.time_expected_text.len(),
                 _ => {}
             }
             self.update_deadline_from_duration();
@@ -389,6 +398,7 @@ impl FormState {
     /// operating on whichever of the two text/cursor pairs `is_start`
     /// selects.
     fn handle_date_key(&mut self, key: KeyEvent, is_start: bool) -> PopupOutcome {
+        let changes_text = matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete);
         {
             let (text, cursor) = if is_start {
                 (&mut self.start_text, &mut self.start_cursor)
@@ -407,6 +417,9 @@ impl FormState {
             }
         }
         if is_start {
+            if changes_text {
+                self.start_is_default = false;
+            }
             self.update_deadline_from_duration();
         }
         self.error = None;
@@ -414,13 +427,19 @@ impl FormState {
     }
 
     fn update_deadline_from_duration(&mut self) {
-        let Ok(Some(start)) = dates::parse_date(&self.start_text, chrono::Utc::now().timestamp()) else {
+        let now = chrono::Utc::now().timestamp();
+        let start = if self.start_is_default {
+            Some(now)
+        } else {
+            dates::parse_date(&self.start_text, now).ok().flatten()
+        };
+        let Some(start) = start else {
             return;
         };
-        let Ok(days) = self.days_expected_text.parse::<i64>() else {
+        let Ok(Some(duration)) = dates::parse_duration(&self.time_expected_text) else {
             return;
         };
-        self.deadline_text = dates::format_date(dates::add_days(start, days));
+        self.deadline_text = dates::format_date(dates::add_duration(start, duration));
         self.deadline_cursor = self.deadline_text.len();
     }
 
@@ -512,6 +531,7 @@ impl FormState {
         }
         let now = chrono::Utc::now().timestamp();
         let start_date = match dates::parse_date(&self.start_text, now) {
+            Ok(_) if self.start_is_default => Some(now),
             Ok(v) => v,
             Err(e) => {
                 self.error = Some(format!("start: {e}"));
@@ -525,19 +545,15 @@ impl FormState {
                 return PopupOutcome::Consumed;
             }
         };
-        let days_expected = if self.days_expected_text.is_empty() {
-            None
-        } else {
-            match self.days_expected_text.parse::<i64>() {
-                Ok(days) => Some(days),
-                Err(_) => {
-                    self.error = Some("days expected must be a whole number".to_string());
-                    return PopupOutcome::Consumed;
-                }
+        let time_expected = match dates::parse_duration(&self.time_expected_text) {
+            Ok(value) => value,
+            Err(e) => {
+                self.error = Some(e);
+                return PopupOutcome::Consumed;
             }
         };
-        let deadline = match (start_date, days_expected) {
-            (Some(start), Some(days)) => Some(dates::add_days(start, days)),
+        let deadline = match (start_date, time_expected) {
+            (Some(start), Some(duration)) => Some(dates::add_duration(start, duration)),
             _ => deadline,
         };
         PopupOutcome::Submit(PopupValue::Form(TaskDraft {
@@ -547,7 +563,7 @@ impl FormState {
             priority: self.priority,
             tags: self.tags.clone(),
             start_date,
-            days_expected,
+            time_expected,
             deadline,
             editing_id: self.editing_id,
             kind: self.kind,
@@ -636,7 +652,7 @@ mod tests {
             Field::Priority,
             Field::Tags,
             Field::Start,
-            Field::DaysExpected,
+            Field::TimeExpected,
             Field::Deadline,
             Field::Body,
         ];
@@ -680,8 +696,27 @@ mod tests {
                 assert_eq!(draft.kind, FormKind::NewTask(Status::ToDo));
                 assert_eq!(draft.status, Status::ToDo);
                 assert!(draft.start_date.is_some());
-                assert_eq!(draft.days_expected, None);
+                assert_eq!(draft.time_expected, None);
                 assert_eq!(draft.deadline, None);
+            }
+            other => panic!("expected Submit(Form(..)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_start_uses_the_creation_timestamp_for_minute_deadlines() {
+        let mut f = FormState::new_task(Status::ToDo);
+        f.title = "take a break".to_string();
+        f.time_expected_text = "10m".to_string();
+        let before_submit = chrono::Utc::now().timestamp();
+
+        let outcome = f.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let after_submit = chrono::Utc::now().timestamp();
+        match outcome {
+            PopupOutcome::Submit(PopupValue::Form(draft)) => {
+                let start = draft.start_date.unwrap();
+                assert!((before_submit..=after_submit).contains(&start));
+                assert_eq!(draft.deadline.unwrap() - start, 600);
             }
             other => panic!("expected Submit(Form(..)), got {other:?}"),
         }
@@ -768,6 +803,28 @@ mod tests {
     }
 
     #[test]
+    fn time_expected_accepts_minutes_hours_days_and_updates_deadline() {
+        let mut f = FormState::new_task(Status::ToDo);
+        f.title = "ship it".to_string();
+        f.start_text = "2030-01-15".to_string();
+        f.start_is_default = false;
+        f.field = Field::TimeExpected;
+        for c in "4h".chars() {
+            f.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(f.deadline_text, "2030-01-15");
+
+        let outcome = f.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        match outcome {
+            PopupOutcome::Submit(PopupValue::Form(draft)) => {
+                assert_eq!(draft.time_expected, Some(14_400));
+                assert_eq!(draft.deadline.unwrap() - draft.start_date.unwrap(), 14_400);
+            }
+            other => panic!("expected Submit(Form(..)), got {other:?}"),
+        }
+    }
+
+    #[test]
     fn unparseable_deadline_blocks_submit_with_inline_error() {
         let mut f = FormState::new_task(Status::ToDo);
         f.title = "ship it".to_string();
@@ -808,12 +865,13 @@ mod tests {
             Priority::High,
             Status::Doing,
             Some(1_700_000_000),
-            None,
+            Some(14_400),
             Some(1_800_000_000),
             Vec::new(),
         );
         assert_eq!(f.status, Status::Doing);
         assert_eq!(f.start_text, dates::format_date(1_700_000_000));
+        assert_eq!(f.time_expected_text, "4h");
         assert_eq!(f.deadline_text, dates::format_date(1_800_000_000));
     }
 

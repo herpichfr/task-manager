@@ -246,6 +246,9 @@ impl<'a> TaskStore for PlainBoardStore<'a> {
     fn update_task(&self, id: TaskId, patch: TaskPatch) -> Result<(), StorageError> {
         shared::update_task(self.conn, Some(self.board_id), id, patch)
     }
+    fn mark_deadline_notified(&self, id: TaskId) -> Result<(), StorageError> {
+        shared::mark_deadline_notified(self.conn, Some(self.board_id), id)
+    }
 
     fn move_task(&self, id: TaskId, to: Status, index: i64) -> Result<(), StorageError> {
         shared::move_task(self.conn, Some(self.board_id), id, to, index)
@@ -315,9 +318,9 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         assert_eq!(migrations::current_version(&conn).unwrap(), 0);
         migrations::apply(&conn, migrations::MIGRATIONS_MAIN).unwrap();
-        assert_eq!(migrations::current_version(&conn).unwrap(), 4);
+        assert_eq!(migrations::current_version(&conn).unwrap(), 6);
         migrations::apply(&conn, migrations::MIGRATIONS_MAIN).unwrap();
-        assert_eq!(migrations::current_version(&conn).unwrap(), 4);
+        assert_eq!(migrations::current_version(&conn).unwrap(), 6);
     }
 
     #[cfg(unix)]
@@ -411,7 +414,7 @@ mod tests {
                 status: Status::ToDo,
                 priority: Priority::Normal,
                 start_date: None,
-                days_expected: None, deadline: None,
+                time_expected: None, deadline: None,
             })
             .unwrap();
         let task = store.get_task(task_id).unwrap();
@@ -437,7 +440,7 @@ mod tests {
                         status: Status::ToDo,
                         priority: Priority::Normal,
                         start_date: None,
-                        days_expected: None, deadline: None,
+                        time_expected: None, deadline: None,
                     })
                     .unwrap(),
             );
@@ -454,7 +457,7 @@ mod tests {
             status,
             priority: Priority::Normal,
             start_date: None,
-            days_expected: None, deadline: None,
+            time_expected: None, deadline: None,
         }
     }
 

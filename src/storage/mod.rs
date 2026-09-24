@@ -35,6 +35,7 @@ pub trait TaskStore {
     fn get_task(&self, id: TaskId) -> Result<Task, StorageError>;
     fn create_task(&self, draft: NewTask) -> Result<TaskId, StorageError>;
     fn update_task(&self, id: TaskId, patch: TaskPatch) -> Result<(), StorageError>;
+    fn mark_deadline_notified(&self, id: TaskId) -> Result<(), StorageError>;
     fn move_task(&self, id: TaskId, to: Status, index: i64) -> Result<(), StorageError>;
     fn reorder(&self, status: Status, ordered: &[TaskId]) -> Result<(), StorageError>;
     fn delete_task(&self, id: TaskId) -> Result<(), StorageError>;

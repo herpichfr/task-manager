@@ -182,8 +182,10 @@ already shows status:
 Cards show a right-aligned deadline badge (`3d`, or `-2d` when overdue). All
 six colours are configurable under `[theme]` in your config file.
 
-In a task form, **Start** defaults to today. Set **Days expected** to derive
-the deadline automatically from its start date; saving after changing either
+In a task form, **Start** displays today and defaults to the task's actual
+creation time. Set **TimeExpected** to derive the deadline automatically
+from that timestamp. Enter a duration as minutes, hours, or days (`10m`,
+`4h`, `15d`); a bare number means minutes. Saving after changing either
 value recalculates the deadline.
 
 ## Encrypted boards

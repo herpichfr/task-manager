@@ -402,7 +402,7 @@ mod tests {
                             status,
                             priority: Priority::Normal,
                             start_date: None,
-                            days_expected: None, deadline: None,
+                            time_expected: None, deadline: None,
                         })
                         .unwrap();
                 }
@@ -584,7 +584,8 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             start_date: None,
-            days_expected: None, deadline: Some(3 * 86_400),
+            time_expected: None, deadline: Some(3 * 86_400),
+            deadline_notified_at: None,
             completed_at: None,
             tags: Vec::new(),
         };
@@ -608,7 +609,8 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             start_date: None,
-            days_expected: None, deadline: Some(-2 * 86_400),
+            time_expected: None, deadline: Some(-2 * 86_400),
+            deadline_notified_at: None,
             completed_at: None,
             tags: Vec::new(),
         };
@@ -629,7 +631,8 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             start_date: None,
-            days_expected: None, deadline: None,
+            time_expected: None, deadline: None,
+            deadline_notified_at: None,
             completed_at: None,
             tags: Vec::new(),
         };
@@ -651,7 +654,8 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             start_date: None,
-            days_expected: None, deadline: None,
+            time_expected: None, deadline: None,
+            deadline_notified_at: None,
             completed_at: None,
             tags: vec![Tag { id: 1, name: "home".to_string(), color: None }],
         };
@@ -675,7 +679,7 @@ mod tests {
                 status: Status::ToDo,
                 priority: Priority::Normal,
                 start_date: None,
-                days_expected: None,
+                time_expected: None,
                 deadline,
             };
             store.create_task(mk("no due date", None)).unwrap();
@@ -715,7 +719,7 @@ mod tests {
                         status: Status::ToDo,
                         priority: Priority::Normal,
                         start_date: None,
-                        days_expected: None, deadline: None,
+                        time_expected: None, deadline: None,
                     })
                     .unwrap();
             }
@@ -831,7 +835,7 @@ mod tests {
                     status: Status::ToDo,
                     priority: Priority::Normal,
                     start_date: None,
-                    days_expected: None, deadline: None,
+                    time_expected: None, deadline: None,
                 })
                 .unwrap();
         }
