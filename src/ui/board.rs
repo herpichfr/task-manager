@@ -7,9 +7,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{note_matches_query, task_matches_query, App};
+use crate::app::{note_matches_query, task_matches_query, App, Pane};
 use crate::domain::board::BoardKind;
 use crate::domain::dates;
+use crate::domain::note::Note;
 use crate::domain::task::{Priority, Status, Task};
 use crate::ui::theme::Styles;
 
@@ -228,7 +229,7 @@ fn render_column(
 ) {
     let col = &app.columns[idx];
     let (label, status_style) = status_label_and_style(status, styles);
-    let focused = idx == app.focused;
+    let focused = app.pane == Pane::Board && idx == app.focused;
 
     let visible: Vec<(usize, &Task)> = col
         .tasks
@@ -294,15 +295,18 @@ fn render_column(
 }
 
 fn render_notes(frame: &mut Frame, area: Rect, app: &App, styles: &Styles, query: Option<&str>) {
+    let focused = app.pane == Pane::Notes;
     let block = Block::bordered()
         .title(Line::from(" Notes "))
         .border_style(styles.border);
     let inner_width = area.width.saturating_sub(2) as usize;
+    let inner_height = area.height.saturating_sub(2) as usize;
 
-    let visible: Vec<_> = app
+    let visible: Vec<(usize, &Note)> = app
         .notes
         .iter()
-        .filter(|n| query.map(|q| note_matches_query(n, q)).unwrap_or(true))
+        .enumerate()
+        .filter(|(_, n)| query.map(|q| note_matches_query(n, q)).unwrap_or(true))
         .collect();
 
     let items: Vec<ListItem> = if visible.is_empty() {
@@ -311,12 +315,31 @@ fn render_notes(frame: &mut Frame, area: Rect, app: &App, styles: &Styles, query
             styles.default.add_modifier(Modifier::DIM),
         )))]
     } else {
-        visible
+        let sel_pos = visible.iter().position(|(i, _)| *i == app.notes_selected).unwrap_or(0);
+        let heights: Vec<usize> = vec![1; visible.len()];
+        let (start, end) = scroll_window(&heights, sel_pos, inner_height);
+
+        visible[start..=end]
             .iter()
-            .map(|note| {
+            .map(|(i, note)| {
                 let first_line = note.body.lines().next().unwrap_or("");
-                let text = truncate_with_ellipsis(first_line, inner_width);
-                ListItem::new(Line::from(Span::styled(text, styles.default)))
+                let text = if first_line.is_empty() {
+                    " ".to_string()
+                } else {
+                    truncate_with_ellipsis(first_line, inner_width)
+                };
+                let style = if *i == app.notes_selected {
+                    if focused {
+                        styles.selection
+                    } else {
+                        styles.default.add_modifier(Modifier::DIM)
+                    }
+                } else if !focused {
+                    styles.default.add_modifier(Modifier::DIM)
+                } else {
+                    styles.default
+                };
+                ListItem::new(Line::from(Span::styled(text, style)))
             })
             .collect()
     };
@@ -866,4 +889,106 @@ mod tests {
         assert!(narrow_rendered.contains("alpha"), "narrow:\n{narrow_rendered}");
         assert!(wide_rendered.contains("alpha beta gamma"), "wide:\n{wide_rendered}");
     }
+
+    fn app_with_notes(notes: &[&str]) -> crate::app::App {
+        let db = MainDb::open_in_memory().unwrap();
+        let board_id = db.create_board("test", BoardKind::Plain).unwrap();
+        {
+            let store = db.store_for(board_id);
+            for n in notes {
+                store.create_note(n).unwrap();
+            }
+        }
+        let board = db.get_board_by_name("test").unwrap().unwrap();
+        let mut app = crate::app::App::new(crate::config::Config::default(), db, board).unwrap();
+        app.show_notes = true;
+        app
+    }
+
+    fn find_str_modifier(buf: &ratatui::buffer::Buffer, text: &str) -> Option<Modifier> {
+        let area = buf.area;
+        for y in area.top()..area.bottom() {
+            let mut line = String::new();
+            for x in area.left()..area.right() {
+                line.push_str(buf[(x, y)].symbol());
+            }
+            if let Some(pos) = line.find(text) {
+                let cell_x = area.left() + pos as u16;
+                return Some(buf[(cell_x, y)].modifier);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn selected_note_in_focused_notes_pane_has_selection_style() {
+        let mut app = app_with_notes(&["note alpha", "note beta"]);
+        app.pane = Pane::Notes;
+        app.notes_selected = 0;
+
+        let backend = Phase5TestBackend::new(80, 24);
+        let mut terminal = Phase5Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        let mod_alpha = find_str_modifier(buf, "note alpha").expect("note alpha found");
+        let mod_beta = find_str_modifier(buf, "note beta").expect("note beta found");
+
+        assert!(mod_alpha.contains(Modifier::REVERSED), "selected note should be reversed");
+        assert!(!mod_beta.contains(Modifier::REVERSED), "unselected note should not be reversed");
+    }
+
+    #[test]
+    fn moving_notes_selection_updates_highlighted_note() {
+        let mut app = app_with_notes(&["note alpha", "note beta"]);
+        app.pane = Pane::Notes;
+        app.notes_selected = 1;
+
+        let backend = Phase5TestBackend::new(80, 24);
+        let mut terminal = Phase5Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        let mod_alpha = find_str_modifier(buf, "note alpha").expect("note alpha found");
+        let mod_beta = find_str_modifier(buf, "note beta").expect("note beta found");
+
+        assert!(!mod_alpha.contains(Modifier::REVERSED), "unselected note should not be reversed");
+        assert!(mod_beta.contains(Modifier::REVERSED), "selected note should be reversed");
+    }
+
+    #[test]
+    fn unfocused_notes_pane_selected_note_is_dimmed() {
+        let mut app = app_with_notes(&["note alpha", "note beta"]);
+        app.pane = Pane::Board; // board focused, notes pane unfocused
+        app.notes_selected = 0;
+
+        let backend = Phase5TestBackend::new(80, 24);
+        let mut terminal = Phase5Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        let mod_alpha = find_str_modifier(buf, "note alpha").expect("note alpha found");
+        assert!(!mod_alpha.contains(Modifier::REVERSED), "unfocused note should not have selection style");
+        assert!(mod_alpha.contains(Modifier::DIM), "unfocused note should be dimmed");
+    }
+
+    #[test]
+    fn notes_pane_scrolls_to_keep_selected_note_visible() {
+        // Create 20 notes
+        let note_titles: Vec<String> = (0..20).map(|i| format!("note item {i:02}")).collect();
+        let note_refs: Vec<&str> = note_titles.iter().map(|s| s.as_str()).collect();
+        let mut app = app_with_notes(&note_refs);
+        app.pane = Pane::Notes;
+        app.notes_selected = 19; // select the last note
+
+        // Terminal height 16 gives notes_area ~4 rows (inner height ~2 rows)
+        let backend = Phase5TestBackend::new(80, 16);
+        let mut terminal = Phase5Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        let rendered = phase5_buffer_to_string(terminal.backend().buffer());
+
+        assert!(rendered.contains("note item 19"), "selected note 19 should be scrolled into view:\n{rendered}");
+        assert!(!rendered.contains("note item 00"), "note item 00 should have scrolled out of view");
+    }
 }
+
