@@ -100,7 +100,12 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut A
         app.check_external_change();
         for task in app.unnotified_deadline_tasks() {
             let body = format!("\"{}\" has reached its deadline.", task.title);
-            match notify_rust::Notification::new().summary("tsk deadline reached").body(&body).show() {
+            match notify_rust::Notification::new()
+                .summary("tsk deadline reached")
+                .body(&body)
+                .timeout(notify_rust::Timeout::Never)
+                .show()
+            {
                 Ok(_) => {
                     if let Err(e) = app.mark_deadline_notified(task.id) {
                         app.message = Some(format!("could not record deadline notification: {e}"));
