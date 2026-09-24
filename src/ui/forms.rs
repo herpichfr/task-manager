@@ -26,6 +26,7 @@ pub enum Field {
     Priority,
     Tags,
     Start,
+    DaysExpected,
     Deadline,
     Body,
 }
@@ -44,6 +45,8 @@ pub struct FormState {
     /// Empty means "no date" (parses to `None`, clearing it).
     pub start_text: String,
     pub start_cursor: usize,
+    pub days_expected_text: String,
+    pub days_expected_cursor: usize,
     pub deadline_text: String,
     pub deadline_cursor: usize,
     pub body: String,
@@ -64,14 +67,15 @@ pub struct TaskDraft {
     pub tags: Vec<String>,
     /// Unix seconds; `None` clears the field.
     pub start_date: Option<i64>,
+    pub days_expected: Option<i64>,
     /// Unix seconds; `None` clears the field.
     pub deadline: Option<i64>,
     pub editing_id: Option<i64>,
     pub kind: FormKind,
 }
 
-const TASK_FIELDS: [Field; 7] =
-    [Field::Title, Field::Status, Field::Priority, Field::Tags, Field::Start, Field::Deadline, Field::Body];
+const TASK_FIELDS: [Field; 8] =
+    [Field::Title, Field::Status, Field::Priority, Field::Tags, Field::Start, Field::DaysExpected, Field::Deadline, Field::Body];
 const NOTE_FIELDS: [Field; 2] = [Field::Title, Field::Body];
 
 fn status_label(status: Status) -> &'static str {
@@ -146,8 +150,10 @@ impl FormState {
             status,
             priority: Priority::default(),
             tags: Vec::new(),
-            start_text: String::new(),
-            start_cursor: 0,
+            start_text: dates::format_date(chrono::Utc::now().timestamp()),
+            start_cursor: 10,
+            days_expected_text: String::new(),
+            days_expected_cursor: 0,
             deadline_text: String::new(),
             deadline_cursor: 0,
             body: String::new(),
@@ -167,6 +173,8 @@ impl FormState {
             tags: Vec::new(),
             start_text: String::new(),
             start_cursor: 0,
+            days_expected_text: String::new(),
+            days_expected_cursor: 0,
             deadline_text: String::new(),
             deadline_cursor: 0,
             body: String::new(),
@@ -187,6 +195,7 @@ impl FormState {
         priority: Priority,
         status: Status,
         start_date: Option<i64>,
+        days_expected: Option<i64>,
         deadline: Option<i64>,
         tags: Vec<String>,
     ) -> Self {
@@ -194,6 +203,8 @@ impl FormState {
         let start_text = start_date.map(dates::format_date).unwrap_or_default();
         let deadline_text = deadline.map(dates::format_date).unwrap_or_default();
         let start_cursor = start_text.len();
+        let days_expected_text = days_expected.map(|days| days.to_string()).unwrap_or_default();
+        let days_expected_cursor = days_expected_text.len();
         let deadline_cursor = deadline_text.len();
         FormState {
             kind: FormKind::EditTask,
@@ -204,6 +215,8 @@ impl FormState {
             tags,
             start_text,
             start_cursor,
+            days_expected_text,
+            days_expected_cursor,
             deadline_text,
             deadline_cursor,
             body,
@@ -230,6 +243,8 @@ impl FormState {
             tags: Vec::new(),
             start_text: String::new(),
             start_cursor: 0,
+            days_expected_text: String::new(),
+            days_expected_cursor: 0,
             deadline_text: String::new(),
             deadline_cursor: 0,
             body: rest,
@@ -328,9 +343,26 @@ impl FormState {
             Field::Priority => self.handle_priority_key(key),
             Field::Tags => self.handle_tags_key(key),
             Field::Start => self.handle_date_key(key, true),
+            Field::DaysExpected => self.handle_days_expected_key(key),
             Field::Deadline => self.handle_date_key(key, false),
             Field::Body => PopupOutcome::Consumed, // Enter on Body is handled by App (needs the terminal).
         }
+    }
+
+    fn handle_days_expected_key(&mut self, key: KeyEvent) -> PopupOutcome {
+            match key.code {
+                KeyCode::Char(c) if c.is_ascii_digit() => text_insert_char(&mut self.days_expected_text, &mut self.days_expected_cursor, c),
+                KeyCode::Backspace => text_backspace(&mut self.days_expected_text, &mut self.days_expected_cursor),
+                KeyCode::Delete => text_delete_forward(&mut self.days_expected_text, &mut self.days_expected_cursor),
+                KeyCode::Left => text_cursor_left(&self.days_expected_text, &mut self.days_expected_cursor),
+                KeyCode::Right => text_cursor_right(&self.days_expected_text, &mut self.days_expected_cursor),
+                KeyCode::Home => self.days_expected_cursor = 0,
+                KeyCode::End => self.days_expected_cursor = self.days_expected_text.len(),
+                _ => {}
+            }
+            self.update_deadline_from_duration();
+            self.error = None;
+            PopupOutcome::Consumed
     }
 
     fn handle_title_key(&mut self, key: KeyEvent) -> PopupOutcome {
@@ -374,8 +406,22 @@ impl FormState {
                 _ => {}
             }
         }
+        if is_start {
+            self.update_deadline_from_duration();
+        }
         self.error = None;
         PopupOutcome::Consumed
+    }
+
+    fn update_deadline_from_duration(&mut self) {
+        let Ok(Some(start)) = dates::parse_date(&self.start_text, chrono::Utc::now().timestamp()) else {
+            return;
+        };
+        let Ok(days) = self.days_expected_text.parse::<i64>() else {
+            return;
+        };
+        self.deadline_text = dates::format_date(dates::add_days(start, days));
+        self.deadline_cursor = self.deadline_text.len();
     }
 
     fn handle_status_key(&mut self, key: KeyEvent) -> PopupOutcome {
@@ -479,6 +525,21 @@ impl FormState {
                 return PopupOutcome::Consumed;
             }
         };
+        let days_expected = if self.days_expected_text.is_empty() {
+            None
+        } else {
+            match self.days_expected_text.parse::<i64>() {
+                Ok(days) => Some(days),
+                Err(_) => {
+                    self.error = Some("days expected must be a whole number".to_string());
+                    return PopupOutcome::Consumed;
+                }
+            }
+        };
+        let deadline = match (start_date, days_expected) {
+            (Some(start), Some(days)) => Some(dates::add_days(start, days)),
+            _ => deadline,
+        };
         PopupOutcome::Submit(PopupValue::Form(TaskDraft {
             title: self.title.clone(),
             status: self.status,
@@ -486,6 +547,7 @@ impl FormState {
             priority: self.priority,
             tags: self.tags.clone(),
             start_date,
+            days_expected,
             deadline,
             editing_id: self.editing_id,
             kind: self.kind,
@@ -574,6 +636,7 @@ mod tests {
             Field::Priority,
             Field::Tags,
             Field::Start,
+            Field::DaysExpected,
             Field::Deadline,
             Field::Body,
         ];
@@ -616,7 +679,8 @@ mod tests {
                 assert_eq!(draft.title, "write the plan");
                 assert_eq!(draft.kind, FormKind::NewTask(Status::ToDo));
                 assert_eq!(draft.status, Status::ToDo);
-                assert_eq!(draft.start_date, None);
+                assert!(draft.start_date.is_some());
+                assert_eq!(draft.days_expected, None);
                 assert_eq!(draft.deadline, None);
             }
             other => panic!("expected Submit(Form(..)), got {other:?}"),
@@ -725,7 +789,7 @@ mod tests {
 
     #[test]
     fn clearing_date_text_clears_the_date_on_submit() {
-        let mut f = FormState::edit_task(1, "t".to_string(), String::new(), Priority::Normal, Status::ToDo, Some(1_700_000_000), None, Vec::new());
+        let mut f = FormState::edit_task(1, "t".to_string(), String::new(), Priority::Normal, Status::ToDo, Some(1_700_000_000), None, None, Vec::new());
         assert_eq!(f.start_text, dates::format_date(1_700_000_000));
         f.start_text.clear();
         let outcome = f.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
@@ -744,6 +808,7 @@ mod tests {
             Priority::High,
             Status::Doing,
             Some(1_700_000_000),
+            None,
             Some(1_800_000_000),
             Vec::new(),
         );
@@ -760,6 +825,7 @@ mod tests {
             "body".to_string(),
             Priority::High,
             Status::Doing,
+            None,
             None,
             None,
             vec!["home".to_string(), "urgent".to_string()],

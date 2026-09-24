@@ -1238,6 +1238,7 @@ impl App {
                     task.priority,
                     task.status,
                     task.start_date,
+                    task.days_expected,
                     task.deadline,
                     tags,
                 )));
@@ -1382,6 +1383,7 @@ impl App {
                     status,
                     priority: draft.priority,
                     start_date: draft.start_date,
+                    days_expected: draft.days_expected,
                     deadline: draft.deadline,
                 };
                 match store.create_task(new_task) {
@@ -1420,6 +1422,7 @@ impl App {
                     status: None,
                     priority: Some(before_task.priority),
                     start_date: Some(before_task.start_date),
+                    days_expected: Some(before_task.days_expected),
                     deadline: Some(before_task.deadline),
                 };
                 let after = TaskPatch {
@@ -1428,6 +1431,7 @@ impl App {
                     status: None,
                     priority: Some(draft.priority),
                     start_date: Some(draft.start_date),
+                    days_expected: Some(draft.days_expected),
                     deadline: Some(draft.deadline),
                 };
                 if let Err(e) = store.update_task(id, after.clone()) {
@@ -1709,6 +1713,7 @@ impl App {
                     status: snapshot.status,
                     priority: snapshot.priority,
                     start_date: snapshot.start_date,
+                    days_expected: snapshot.days_expected,
                     deadline: snapshot.deadline,
                 })?;
                 store.move_task(new_id, snapshot.status, snapshot.position)?;
@@ -2458,6 +2463,7 @@ impl App {
                             task.priority,
                             task.status,
                             task.start_date,
+                            task.days_expected,
                             task.deadline,
                             tags,
                         )));
@@ -2714,7 +2720,7 @@ mod tests {
                         status: Status::ToDo,
                         priority: DomainPriority::Normal,
                     start_date: None,
-                    deadline: None,
+                    days_expected: None, deadline: None,
                     })
                     .unwrap();
             }
@@ -2739,7 +2745,7 @@ mod tests {
                 status: Status::ToDo,
                 priority: DomainPriority::Normal,
                 start_date: None,
-                deadline: None,
+                days_expected: None, deadline: None,
             })
             .unwrap();
         let board = db.get_board_by_name("test").unwrap().unwrap();
@@ -2768,7 +2774,7 @@ mod tests {
                     status: Status::ToDo,
                     priority: DomainPriority::Normal,
                     start_date: None,
-                    deadline: None,
+                    days_expected: None, deadline: None,
                 })
                 .unwrap();
         }
@@ -3427,7 +3433,7 @@ mod tests {
             status: Status::ToDo,
             priority: DomainPriority::Normal,
             start_date: None,
-            deadline: None,
+            days_expected: None, deadline: None,
         }).unwrap();
         let _ = app.reload();
         // titles now: a, b, c, abc -- "a" matches "a" (idx 0) and "abc" (idx 3)
@@ -3497,7 +3503,7 @@ mod tests {
                         status: Status::ToDo,
                         priority: DomainPriority::Normal,
                         start_date: None,
-                        deadline: None,
+                        days_expected: None, deadline: None,
                     })
                     .unwrap();
             }
@@ -3573,7 +3579,7 @@ mod tests {
                         status: Status::Doing,
                         priority: DomainPriority::Normal,
                         start_date: None,
-                        deadline: None,
+                        days_expected: None, deadline: None,
                     })
                     .unwrap();
             }
@@ -4243,6 +4249,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             start_date: None,
+            days_expected: None,
             deadline,
             completed_at: None,
             tags: Vec::new(),
@@ -4324,6 +4331,7 @@ mod tests {
             status: Status::ToDo,
             priority: DomainPriority::Normal,
             start_date: None,
+            days_expected: None,
             deadline,
         }
     }

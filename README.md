@@ -182,6 +182,10 @@ already shows status:
 Cards show a right-aligned deadline badge (`3d`, or `-2d` when overdue). All
 six colours are configurable under `[theme]` in your config file.
 
+In a task form, **Start** defaults to today. Set **Days expected** to derive
+the deadline automatically from its start date; saving after changing either
+value recalculates the deadline.
+
 ## Encrypted boards
 
 Any board can be created locked (`:board new <name> locked`, or `A` in the

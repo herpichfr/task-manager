@@ -73,8 +73,16 @@ ALTER TABLE tasks ADD COLUMN completed_at INTEGER;
 UPDATE tasks SET completed_at = updated_at WHERE status = 'done';
 ";
 
-pub const MIGRATIONS_MAIN: &[(i64, &str)] = &[(1, MAIN_V1), (2, MAIN_V2), (3, MAIN_V3)];
-pub const MIGRATIONS_BOARD: &[(i64, &str)] = &[(1, BOARD_V1), (2, BOARD_V2), (3, BOARD_V3)];
+const MAIN_V4: &str = "
+ALTER TABLE tasks ADD COLUMN days_expected INTEGER;
+";
+
+const BOARD_V4: &str = "
+ALTER TABLE tasks ADD COLUMN days_expected INTEGER;
+";
+
+pub const MIGRATIONS_MAIN: &[(i64, &str)] = &[(1, MAIN_V1), (2, MAIN_V2), (3, MAIN_V3), (4, MAIN_V4)];
+pub const MIGRATIONS_BOARD: &[(i64, &str)] = &[(1, BOARD_V1), (2, BOARD_V2), (3, BOARD_V3), (4, BOARD_V4)];
 
 const CREATE_VERSION_TABLE: &str = "CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER PRIMARY KEY,
@@ -147,7 +155,7 @@ mod tests {
         let task_id = conn.last_insert_rowid();
 
         apply(&conn, MIGRATIONS_MAIN).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 3);
+        assert_eq!(current_version(&conn).unwrap(), 4);
 
         let (title, start_date, deadline): (String, Option<i64>, Option<i64>) = conn
             .query_row(
@@ -181,7 +189,7 @@ mod tests {
         let task_id = conn.last_insert_rowid();
 
         apply(&conn, MIGRATIONS_BOARD).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 3);
+        assert_eq!(current_version(&conn).unwrap(), 4);
 
         let (title, start_date, deadline): (String, Option<i64>, Option<i64>) = conn
             .query_row(
@@ -200,9 +208,9 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         assert_eq!(current_version(&conn).unwrap(), 0);
         apply(&conn, MIGRATIONS_MAIN).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 3);
+        assert_eq!(current_version(&conn).unwrap(), 4);
         apply(&conn, MIGRATIONS_MAIN).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 3);
+        assert_eq!(current_version(&conn).unwrap(), 4);
     }
 
     /// A v2 database with an existing Done row must upgrade to v3 in
@@ -237,7 +245,7 @@ mod tests {
         let todo_id = conn.last_insert_rowid();
 
         apply(&conn, MIGRATIONS_MAIN).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 3);
+        assert_eq!(current_version(&conn).unwrap(), 4);
 
         let done_completed: Option<i64> = conn
             .query_row(
@@ -285,7 +293,7 @@ mod tests {
         let todo_id = conn.last_insert_rowid();
 
         apply(&conn, MIGRATIONS_BOARD).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 3);
+        assert_eq!(current_version(&conn).unwrap(), 4);
 
         let done_completed: Option<i64> = conn
             .query_row(

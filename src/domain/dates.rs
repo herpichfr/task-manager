@@ -64,6 +64,11 @@ pub fn format_date(ts: i64) -> String {
     local_date_from_epoch(ts).format("%Y-%m-%d").to_string()
 }
 
+/// Adds calendar days while preserving local-date semantics.
+pub fn add_days(ts: i64, days: i64) -> i64 {
+    midnight_epoch(local_date_from_epoch(ts) + Duration::days(days))
+}
+
 /// Whole days from `now` until `deadline`, negative when overdue. Both are
 /// compared at local-midnight granularity by comparing calendar dates, so a
 /// deadline later *today* is 0, not a fraction of a day.

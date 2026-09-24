@@ -315,9 +315,9 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         assert_eq!(migrations::current_version(&conn).unwrap(), 0);
         migrations::apply(&conn, migrations::MIGRATIONS_MAIN).unwrap();
-        assert_eq!(migrations::current_version(&conn).unwrap(), 3);
+        assert_eq!(migrations::current_version(&conn).unwrap(), 4);
         migrations::apply(&conn, migrations::MIGRATIONS_MAIN).unwrap();
-        assert_eq!(migrations::current_version(&conn).unwrap(), 3);
+        assert_eq!(migrations::current_version(&conn).unwrap(), 4);
     }
 
     #[cfg(unix)]
@@ -411,7 +411,7 @@ mod tests {
                 status: Status::ToDo,
                 priority: Priority::Normal,
                 start_date: None,
-                deadline: None,
+                days_expected: None, deadline: None,
             })
             .unwrap();
         let task = store.get_task(task_id).unwrap();
@@ -437,7 +437,7 @@ mod tests {
                         status: Status::ToDo,
                         priority: Priority::Normal,
                         start_date: None,
-                        deadline: None,
+                        days_expected: None, deadline: None,
                     })
                     .unwrap(),
             );
@@ -454,7 +454,7 @@ mod tests {
             status,
             priority: Priority::Normal,
             start_date: None,
-            deadline: None,
+            days_expected: None, deadline: None,
         }
     }
 

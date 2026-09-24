@@ -37,6 +37,7 @@ type RawTaskRow = (
     Option<i64>,
     Option<i64>,
     Option<i64>,
+    Option<i64>,
 );
 
 fn row_to_raw_task(row: &rusqlite::Row) -> rusqlite::Result<RawTaskRow> {
@@ -52,11 +53,12 @@ fn row_to_raw_task(row: &rusqlite::Row) -> rusqlite::Result<RawTaskRow> {
         row.get(8)?,
         row.get(9)?,
         row.get(10)?,
+        row.get(11)?,
     ))
 }
 
 fn task_from_parts(board_id: Option<BoardId>, raw: RawTaskRow) -> Result<Task, StorageError> {
-    let (id, title, body, status, priority, position, created_at, updated_at, start_date, deadline, completed_at) = raw;
+    let (id, title, body, status, priority, position, created_at, updated_at, start_date, deadline, completed_at, days_expected) = raw;
     let status = Status::from_str(&status).ok_or_else(|| StorageError::InvalidEnum(status.clone()))?;
     let priority = Priority::from_str(&priority).ok_or_else(|| StorageError::InvalidEnum(priority.clone()))?;
     Ok(Task {
@@ -70,6 +72,7 @@ fn task_from_parts(board_id: Option<BoardId>, raw: RawTaskRow) -> Result<Task, S
         created_at,
         updated_at,
         start_date,
+        days_expected,
         deadline,
         completed_at,
         tags: Vec::new(),
@@ -88,7 +91,7 @@ fn note_from_parts(board_id: Option<BoardId>, raw: RawNoteRow) -> Note {
 }
 
 const TASK_COLUMNS: &str =
-    "id, title, body, status, priority, position, created_at, updated_at, start_date, deadline, completed_at";
+    "id, title, body, status, priority, position, created_at, updated_at, start_date, deadline, completed_at, days_expected";
 
 /// Loads the tags for several tasks in one query (`task_id IN (...)`),
 /// grouped by `task_id`. Called once per `list_tasks`/`get_task` call
@@ -184,8 +187,8 @@ pub(crate) fn create_task(conn: &Connection, board_id: Option<BoardId>, draft: N
     };
     match board_id {
         Some(bid) => conn.execute(
-            "INSERT INTO tasks (board_id, title, body, status, priority, position, created_at, updated_at, start_date, deadline, completed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?10)",
+            "INSERT INTO tasks (board_id, title, body, status, priority, position, created_at, updated_at, start_date, days_expected, deadline, completed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 bid,
                 draft.title,
@@ -195,13 +198,14 @@ pub(crate) fn create_task(conn: &Connection, board_id: Option<BoardId>, draft: N
                 next_position,
                 now,
                 draft.start_date,
+                draft.days_expected,
                 draft.deadline,
                 completed_at
             ],
         )?,
         None => conn.execute(
-            "INSERT INTO tasks (title, body, status, priority, position, created_at, updated_at, start_date, deadline, completed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9)",
+            "INSERT INTO tasks (title, body, status, priority, position, created_at, updated_at, start_date, days_expected, deadline, completed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 draft.title,
                 draft.body,
@@ -210,6 +214,7 @@ pub(crate) fn create_task(conn: &Connection, board_id: Option<BoardId>, draft: N
                 next_position,
                 now,
                 draft.start_date,
+                draft.days_expected,
                 draft.deadline,
                 completed_at
             ],
@@ -241,6 +246,10 @@ pub(crate) fn update_task(conn: &Connection, board_id: Option<BoardId>, id: Task
     if let Some(start_date) = patch.start_date {
         set_clauses.push("start_date = ?");
         values.push(Box::new(start_date));
+    }
+    if let Some(days_expected) = patch.days_expected {
+        set_clauses.push("days_expected = ?");
+        values.push(Box::new(days_expected));
     }
     if let Some(deadline) = patch.deadline {
         set_clauses.push("deadline = ?");
@@ -635,7 +644,7 @@ pub(crate) mod shared_tests {
             status: Status::ToDo,
             priority: Priority::Normal,
             start_date: None,
-            deadline: None,
+            days_expected: None, deadline: None,
         }
     }
 
@@ -648,7 +657,7 @@ pub(crate) mod shared_tests {
         let dated_id = store
             .create_task(NewTask {
                 start_date: Some(1_000),
-                deadline: Some(2_000),
+                days_expected: None, deadline: Some(2_000),
                 ..new_task("with dates")
             })
             .unwrap();

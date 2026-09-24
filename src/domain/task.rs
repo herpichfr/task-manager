@@ -101,6 +101,8 @@ pub struct Task {
     pub updated_at: i64,
     /// Unix seconds, `None` = unset.
     pub start_date: Option<i64>,
+    /// Expected duration in calendar days, `None` = unset.
+    pub days_expected: Option<i64>,
     /// Unix seconds, `None` = unset.
     pub deadline: Option<i64>,
     /// Unix seconds the task most recently entered `Status::Done`, `None`
@@ -119,6 +121,8 @@ pub struct NewTask {
     pub priority: Priority,
     /// Unix seconds, `None` = unset.
     pub start_date: Option<i64>,
+    /// Expected duration in calendar days, `None` = unset.
+    pub days_expected: Option<i64>,
     /// Unix seconds, `None` = unset.
     pub deadline: Option<i64>,
 }
@@ -131,6 +135,8 @@ pub struct TaskPatch {
     pub priority: Option<Priority>,
     /// `None` = leave unchanged, `Some(None)` = clear, `Some(Some(v))` = set.
     pub start_date: Option<Option<i64>>,
+    /// `None` = leave unchanged, `Some(None)` = clear, `Some(Some(v))` = set.
+    pub days_expected: Option<Option<i64>>,
     /// `None` = leave unchanged, `Some(None)` = clear, `Some(Some(v))` = set.
     pub deadline: Option<Option<i64>>,
 }

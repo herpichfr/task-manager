@@ -402,7 +402,7 @@ mod tests {
                             status,
                             priority: Priority::Normal,
                             start_date: None,
-                            deadline: None,
+                            days_expected: None, deadline: None,
                         })
                         .unwrap();
                 }
@@ -584,7 +584,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             start_date: None,
-            deadline: Some(3 * 86_400),
+            days_expected: None, deadline: Some(3 * 86_400),
             completed_at: None,
             tags: Vec::new(),
         };
@@ -608,7 +608,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             start_date: None,
-            deadline: Some(-2 * 86_400),
+            days_expected: None, deadline: Some(-2 * 86_400),
             completed_at: None,
             tags: Vec::new(),
         };
@@ -629,7 +629,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             start_date: None,
-            deadline: None,
+            days_expected: None, deadline: None,
             completed_at: None,
             tags: Vec::new(),
         };
@@ -651,7 +651,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             start_date: None,
-            deadline: None,
+            days_expected: None, deadline: None,
             completed_at: None,
             tags: vec![Tag { id: 1, name: "home".to_string(), color: None }],
         };
@@ -675,6 +675,7 @@ mod tests {
                 status: Status::ToDo,
                 priority: Priority::Normal,
                 start_date: None,
+                days_expected: None,
                 deadline,
             };
             store.create_task(mk("no due date", None)).unwrap();
@@ -714,7 +715,7 @@ mod tests {
                         status: Status::ToDo,
                         priority: Priority::Normal,
                         start_date: None,
-                        deadline: None,
+                        days_expected: None, deadline: None,
                     })
                     .unwrap();
             }
@@ -830,7 +831,7 @@ mod tests {
                     status: Status::ToDo,
                     priority: Priority::Normal,
                     start_date: None,
-                    deadline: None,
+                    days_expected: None, deadline: None,
                 })
                 .unwrap();
         }
@@ -991,4 +992,3 @@ mod tests {
         assert!(!rendered.contains("note item 00"), "note item 00 should have scrolled out of view");
     }
 }
-

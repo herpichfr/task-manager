@@ -201,7 +201,7 @@ mod tests {
                     status: Status::ToDo,
                     priority: Priority::Normal,
                     start_date: None,
-                    deadline: None,
+                    days_expected: None, deadline: None,
                 })
                 .unwrap();
         }
@@ -264,7 +264,7 @@ mod tests {
                     status: Status::ToDo,
                     priority: Priority::Normal,
                     start_date: None,
-                    deadline: None,
+                    days_expected: None, deadline: None,
                 })
                 .unwrap();
         }
@@ -311,7 +311,7 @@ mod tests {
                     status: Status::ToDo,
                     priority: Priority::Normal,
                     start_date: None,
-                    deadline: None,
+                    days_expected: None, deadline: None,
                 })
                 .unwrap();
         }
@@ -332,13 +332,13 @@ mod tests {
         let store = db.store();
 
         let a = store
-            .create_task(NewTask { title: "a".into(), body: String::new(), status: Status::ToDo, priority: Priority::Normal, start_date: None, deadline: None })
+            .create_task(NewTask { title: "a".into(), body: String::new(), status: Status::ToDo, priority: Priority::Normal, start_date: None, days_expected: None, deadline: None })
             .unwrap();
         let b = store
-            .create_task(NewTask { title: "b".into(), body: String::new(), status: Status::ToDo, priority: Priority::Normal, start_date: None, deadline: None })
+            .create_task(NewTask { title: "b".into(), body: String::new(), status: Status::ToDo, priority: Priority::Normal, start_date: None, days_expected: None, deadline: None })
             .unwrap();
         let c = store
-            .create_task(NewTask { title: "c".into(), body: String::new(), status: Status::ToDo, priority: Priority::Normal, start_date: None, deadline: None })
+            .create_task(NewTask { title: "c".into(), body: String::new(), status: Status::ToDo, priority: Priority::Normal, start_date: None, days_expected: None, deadline: None })
             .unwrap();
 
         store.move_task(a, Status::Doing, 0).unwrap();
